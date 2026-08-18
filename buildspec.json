@@ -33,13 +33,13 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.example.plugintemplate-for-obs"
+            "bundleId": "dev.voidscape.transition-tree"
         }
     },
-    "name": "plugintemplate-for-obs",
-    "displayName": "Plugin Template for OBS",
-    "version": "1.0.0",
-    "author": "Your Name Here",
-    "website": "https://example.com",
-    "email": "me@example.com"
+    "name": "transition-tree",
+    "displayName": "Transition Tree",
+    "version": "0.1.0",
+    "author": "Voidscape Development",
+    "website": "https://voidscape.dev",
+    "email": "dev@voidscape.dev"
 }
