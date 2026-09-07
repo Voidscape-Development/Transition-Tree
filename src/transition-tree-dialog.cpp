@@ -94,6 +94,18 @@ QColor InvalidColor()
 	return QColor(0xE0, 0x5A, 0x5A);
 }
 
+/* OBS hands out scenes and transitions in dock order, which is arbitrary once
+ * a collection grows. Lists the user has to hunt through are sorted the way
+ * they would sort them by hand: case-insensitively, with case only breaking
+ * ties so the order stays stable. */
+void SortNames(QStringList &names)
+{
+	std::sort(names.begin(), names.end(), [](const QString &a, const QString &b) {
+		const int order = QString::compare(a, b, Qt::CaseInsensitive);
+		return order != 0 ? order < 0 : a < b;
+	});
+}
+
 QString MarkSummary(const Mark &mark)
 {
 	const auto usable = mark.UsableCandidates();
@@ -828,6 +840,8 @@ void TransitionTreeDialog::RefreshMatcherWidgets(const SceneMatcher &matcher, QC
 			scenes << scene;
 	}
 
+	SortNames(scenes);
+
 	const auto missing = matcher.MissingScenes();
 	for (const QString &scene : scenes) {
 		auto *item = new QListWidgetItem(scene, sceneList);
@@ -889,7 +903,8 @@ void TransitionTreeDialog::RefreshCandidateTable(Mark &mark)
 	m_updating = true;
 
 	const int previousRow = m_candidates->currentRow();
-	const QStringList transitions = TransitionNames();
+	QStringList transitions = TransitionNames();
+	SortNames(transitions);
 
 	m_candidates->setRowCount((int)mark.candidates.size());
 
@@ -996,8 +1011,11 @@ void TransitionTreeDialog::RefreshPresetPage()
 	m_setDefaultTransition->setEnabled(true);
 	m_setDefaultTransition->setChecked(preset->setDefaultTransition);
 
+	QStringList transitions = TransitionNames();
+	SortNames(transitions);
+
 	m_defaultTransition->clear();
-	m_defaultTransition->addItems(TransitionNames());
+	m_defaultTransition->addItems(transitions);
 	m_defaultTransition->setCurrentText(QString::fromUtf8(preset->defaultTransition.c_str()));
 	m_defaultTransition->setEnabled(preset->setDefaultTransition);
 
