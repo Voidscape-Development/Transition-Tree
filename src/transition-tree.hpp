@@ -229,6 +229,27 @@ bool ResolveTransition(const std::string &canvas, const std::string &fromScene, 
 /* Finds the mark that would drive a given switch, or nullptr. */
 Mark *ResolveMark(const std::string &canvas, const std::string &fromScene, const std::string &toScene);
 
+/* Why a mark whose scenes match a switch does or does not drive it. */
+enum class MatchOutcome {
+	Wins,            /* the mark that fires */
+	LessSpecific,    /* a more specific mark wins */
+	TiedListedLater, /* as specific as the winner, but listed after it */
+	Off,             /* turned off */
+	NoTransition     /* no transition turned on */
+};
+
+struct MatchExplanation {
+	size_t index; /* position in Preset::marks */
+	MatchOutcome outcome;
+};
+
+/* Every mark in `preset` whose canvas and scenes match the switch, in list
+ * order, with the reason it does or does not fire. This is the resolution
+ * ResolveMark uses, so the editor's explanation can never disagree with what
+ * the engine does. It ignores the master switch. */
+std::vector<MatchExplanation> ExplainSwitch(const Preset &preset, const std::string &canvas,
+					    const std::string &fromScene, const std::string &toScene);
+
 void SetActivePreset(const std::string &name);
 void CycleActivePreset(int delta);
 void SetTreeEnabled(bool enabled);

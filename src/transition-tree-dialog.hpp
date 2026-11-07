@@ -22,6 +22,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <QDialog>
 #include <QString>
+#include <QStringList>
 
 #include <memory>
 #include <string>
@@ -89,6 +90,7 @@ private:
 	QWidget *BuildPresetBar();
 	QWidget *BuildOffBanner();
 	QWidget *BuildTreePane();
+	QWidget *BuildChecker();
 	QWidget *BuildDetailPane();
 	QWidget *BuildMarkPage();
 	QWidget *BuildPresetPage();
@@ -100,6 +102,8 @@ private:
 	void RefreshPresetCombo();
 	void RefreshPresetActions();
 	void RefreshTree();
+	void RefreshCheckerScenes();
+	void RefreshChecker();
 	void RefreshDetail();
 	void RefreshMarkActions();
 	void RefreshMarkPage(tt::Mark &mark);
@@ -130,6 +134,10 @@ private:
 	void UndoDeleteMark();
 	void ClearUndo();
 	void ToggleMarkEnabled();
+	void MoveMark(int delta);
+	void PreferMark(const std::string &markId);
+	void OnCheckerLink(const QString &link);
+	void SelectMark(const std::string &markId);
 	void TestMark();
 	void AddCandidate();
 	void RemoveCandidate(int row);
@@ -151,6 +159,8 @@ private:
 	QAction *m_deleteMarkAction = nullptr;
 	QAction *m_toggleMarkAction = nullptr;
 	QAction *m_testMarkAction = nullptr;
+	QAction *m_moveUpAction = nullptr;
+	QAction *m_moveDownAction = nullptr;
 
 	QAction *m_duplicatePresetAction = nullptr;
 	QAction *m_renamePresetAction = nullptr;
@@ -176,6 +186,14 @@ private:
 	QLabel *m_undoLabel = nullptr;
 	QTimer *m_undoTimer = nullptr;
 	QLabel *m_treeFooter = nullptr;
+
+	/* "Which rule wins?" checker */
+	QPushButton *m_checkerButton = nullptr;
+	QFrame *m_checker = nullptr;
+	QComboBox *m_checkFrom = nullptr;
+	QComboBox *m_checkTo = nullptr;
+	QComboBox *m_checkCanvas = nullptr;
+	QLabel *m_checkResult = nullptr;
 
 	QStackedWidget *m_detail = nullptr;
 
@@ -207,6 +225,9 @@ private:
 	QComboBox *m_defaultTransition = nullptr;
 	QSpinBox *m_defaultDuration = nullptr;
 	QPushButton *m_presetExportButton = nullptr;
+
+	/* From-groups the user collapsed, so a rebuild keeps them closed. */
+	QStringList m_collapsedGroups;
 
 	/* Selected mark id, so selection survives a tree rebuild. */
 	std::string m_selectedMarkId;

@@ -15,16 +15,22 @@ be imported.
 - **Presets.** Save whole sets of rules and switch between them. Each preset is
   either *local* to a scene collection or *global* and offered in every
   collection; each scene collection remembers which preset it had active.
-- **Several transitions per mark.** A single from → to rule can hold a list of
+- **Several transitions per rule.** A single from → to rule can hold a list of
   transitions, chosen **sequentially**, at **random**, at **random without
   repeating** the previous pick, or by **weighted random**.
-- **Flexible scene matching.** Either side of a mark can name specific scenes
+- **Flexible scene matching.** Either side of a rule can name specific scenes
   (more than one), match *any* scene, or match *any scene except* a named set.
-- **Enable and disable marks** individually without deleting them.
-- **A tree instead of dropdown-driven filtering.** Marks are grouped by their
-  from-scene, and the search box only ever filters the view — adding a mark is a
+- **Enable and disable rules** individually without deleting them.
+- **A tree instead of dropdown-driven filtering.** Rules are grouped by their
+  from-scene, and the search box only ever filters the view — adding a rule is a
   separate button, so narrowing the list can never hide the controls needed to
   create one.
+- **"Which rule wins?" checker.** Pick a from and a to scene to see which rule
+  fires for that switch and why each other matching rule doesn't. The tree
+  highlights the winner in green and the losing matches in amber.
+- **Visible, changeable priority.** The `#` column shows each rule's place in
+  the preset, which decides ties. Reorder with Alt+↑ / Alt+↓, the right-click
+  menu, or the checker's *Make it win* link.
 - **Hotkeys** for activating each preset by name, stepping to the next or
   previous preset, and enabling or disabling the whole tree.
 - **obs-websocket vendor requests**, including preset switching, plus
@@ -42,12 +48,12 @@ recalculated whenever a transition starts, the program scene changes, or channel
 0 changes, for every canvas.
 
 Only scenes this plugin has actually written to are ever cleared again, so a
-transition override you set in OBS yourself is left alone unless a mark targets
+transition override you set in OBS yourself is left alone unless a rule targets
 that scene.
 
-### Which mark wins
+### Which rule wins
 
-Several marks can match the same switch. The most specific one wins, from-side
+Several rules can match the same switch. The most specific one wins, from-side
 first:
 
 | Match type | Specificity |
@@ -56,17 +62,19 @@ first:
 | Any except … | middle |
 | Any scene | lowest |
 
-So `A → not-C` beats `Any → D`, but loses to `A → D`. When two marks tie, the
-one listed first in the preset wins. Marks that are disabled, that name no
-scenes, or that have no usable transition are skipped entirely, and the next
-matching rule applies.
+So `A → not-C` beats `Any → D`, but loses to `A → D`. When two rules tie, the
+one with the lower `#` (listed first in the preset) wins. Rules that are
+disabled, that name no scenes, or that have no usable transition are skipped
+entirely, and the next matching rule applies. The **Which Rule Wins?** button in
+the editor answers this for any pair of scenes, using the same code the plugin
+runs at switch time.
 
 ### Choosing between several transitions
 
 The pick for each possible destination is made when you arrive on a scene, and
 held until you leave it — so each switch consumes exactly one random roll rather
 than re-rolling on every incidental signal. Sequential positions advance only
-for the mark that actually fired. Positions last for the session, and reset when
+for the rule that actually fired. Positions last for the session, and reset when
 a preset is activated.
 
 ## Building
@@ -102,7 +110,10 @@ response carries `success`, plus `error` when it is false.
 Activating a preset emits the vendor event `preset_changed` with `preset` and
 `enabled`.
 
-### Marks
+### Rules
+
+Rules are called *marks* in the obs-websocket API, so request names, fields and
+saved data stay compatible with earlier versions.
 
 | Request | Fields | Returns |
 |---|---|---|
@@ -111,7 +122,7 @@ Activating a preset emits the vendor event `preset_changed` with `preset` and
 | `remove_mark` | `id`, `preset` (optional) | — |
 | `set_mark_enabled` | `id`, `enabled`, `preset` (optional) | — |
 
-`set_mark` creates a mark, or updates one when `id` is given. Omitting `preset`
+`set_mark` creates a rule, or updates one when `id` is given. Omitting `preset`
 targets the active preset.
 
 ```jsonc
@@ -136,7 +147,7 @@ accepted instead of the `transitions` array.
 
 `get_transition`, `set_transition` and `get_table` are registered under the same
 names and shapes Transition Table uses, so existing scripts keep working — note
-that the vendor name is `transition-tree`, and that `get_table` flattens marks
+that the vendor name is `transition-tree`, and that `get_table` flattens rules
 into one row per scene pair per transition.
 
 ### Procedure handler
@@ -162,7 +173,7 @@ Global presets are stored in the plugin's config directory as
 - **Running Transition Table at the same time is not supported.** Both plugins
   write the same per-scene overrides and will overwrite each other. Transition
   Tree detects it at load, logs a warning and says so once when the window opens.
-- Marks in a global preset that reference scenes missing from the current
+- Rules in a global preset that reference scenes missing from the current
   collection are kept and shown in red, and skipped at runtime.
 
 ## Credits

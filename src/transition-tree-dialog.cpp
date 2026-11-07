@@ -52,6 +52,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QShortcut>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QSplitter>
 #include <QStackedWidget>
@@ -85,7 +86,7 @@ constexpr int kGroupKeyRole = Qt::UserRole + 2;
 /* How long a deleted mark can still be restored from the undo bar. */
 constexpr int kUndoTimeoutMs = 8000;
 
-enum TreeColumn { kColScenes = 0, kColTransition, kColMode, kColCanvas, kTreeColumnCount };
+enum TreeColumn { kColScenes = 0, kColTransition, kColMode, kColOrder, kColCanvas, kTreeColumnCount };
 
 enum CandidateColumn {
 	kCandTransition = 0,
@@ -108,6 +109,7 @@ QFrame#ttBanner, QLabel#ttWarning {
 	border-radius: 4px;
 }
 QLabel#ttWarning { padding: 6px 8px; }
+QFrame#ttChecker { background-color: rgba(74, 114, 240, 0.12); border: 1px solid rgba(74, 114, 240, 0.45); border-radius: 4px; }
 QFrame#ttUndoBar { background-color: rgba(127, 127, 127, 0.18); border-radius: 4px; }
 QPushButton#ttTest { color: #e05a5a; }
 QLabel#ttTitle { font-size: 14pt; font-weight: bold; }
@@ -450,6 +452,18 @@ void TransitionTreeDialog::BuildActions()
 	m_testMarkAction->setToolTip(Tr("Mark.Test.Tooltip"));
 	connect(m_testMarkAction, &QAction::triggered, this, &TransitionTreeDialog::TestMark);
 
+	/* Order only decides ties between equally specific rules, but it is
+	 * real, so it can be seen (the # column) and changed. */
+	m_moveUpAction = new QAction(Tr("Mark.MoveUp"), this);
+	m_moveUpAction->setShortcut(QKeySequence(Qt::ALT | Qt::Key_Up));
+	m_moveUpAction->setShortcutContext(Qt::WidgetShortcut);
+	connect(m_moveUpAction, &QAction::triggered, this, [this]() { MoveMark(-1); });
+
+	m_moveDownAction = new QAction(Tr("Mark.MoveDown"), this);
+	m_moveDownAction->setShortcut(QKeySequence(Qt::ALT | Qt::Key_Down));
+	m_moveDownAction->setShortcutContext(Qt::WidgetShortcut);
+	connect(m_moveDownAction, &QAction::triggered, this, [this]() { MoveMark(1); });
+
 	auto *find = new QShortcut(QKeySequence::Find, this);
 	connect(find, &QShortcut::activated, this, [this]() {
 		m_search->setFocus(Qt::ShortcutFocusReason);
@@ -578,11 +592,27 @@ QWidget *TransitionTreeDialog::BuildTreePane()
 	addMark->setAutoDefault(false);
 	connect(addMark, &QPushButton::clicked, this, &TransitionTreeDialog::AddMark);
 	toolbar->addWidget(addMark);
+
+	m_checkerButton = new QPushButton(Tr("Checker.Toggle"));
+	m_checkerButton->setToolTip(Tr("Checker.Tooltip"));
+	m_checkerButton->setCheckable(true);
+	m_checkerButton->setAutoDefault(false);
+	connect(m_checkerButton, &QPushButton::toggled, this, [this](bool checked) {
+		m_checker->setVisible(checked);
+		if (checked)
+			RefreshCheckerScenes();
+		/* Rebuilding applies or clears the row highlights. */
+		RefreshTree();
+	});
+	toolbar->addWidget(m_checkerButton);
 	layout->addLayout(toolbar);
+	layout->addWidget(BuildChecker());
 
 	m_tree = new QTreeWidget;
 	m_tree->setColumnCount(kTreeColumnCount);
-	m_tree->setHeaderLabels({Tr("Column.Scenes"), Tr("Column.Transition"), Tr("Column.Mode"), Tr("Column.Canvas")});
+	m_tree->setHeaderLabels({Tr("Column.Scenes"), Tr("Column.Transition"), Tr("Column.Mode"), Tr("Column.Order"),
+				 Tr("Column.Canvas")});
+	m_tree->headerItem()->setToolTip(kColOrder, Tr("Column.Order.Tooltip"));
 	m_tree->setRootIsDecorated(true);
 	m_tree->setAlternatingRowColors(true);
 	m_tree->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -590,10 +620,13 @@ QWidget *TransitionTreeDialog::BuildTreePane()
 	m_tree->header()->setSectionResizeMode(kColScenes, QHeaderView::Stretch);
 	m_tree->header()->setSectionResizeMode(kColTransition, QHeaderView::ResizeToContents);
 	m_tree->header()->setSectionResizeMode(kColMode, QHeaderView::ResizeToContents);
+	m_tree->header()->setSectionResizeMode(kColOrder, QHeaderView::ResizeToContents);
 	m_tree->header()->setSectionResizeMode(kColCanvas, QHeaderView::ResizeToContents);
 	m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
 	m_tree->addAction(m_duplicateMarkAction);
 	m_tree->addAction(m_deleteMarkAction);
+	m_tree->addAction(m_moveUpAction);
+	m_tree->addAction(m_moveDownAction);
 	connect(m_tree, &QTreeWidget::customContextMenuRequested, this, &TransitionTreeDialog::ShowTreeContextMenu);
 	connect(m_tree, &QTreeWidget::itemSelectionChanged, this, &TransitionTreeDialog::OnTreeSelectionChanged);
 	connect(m_tree, &QTreeWidget::itemChanged, this, [this](QTreeWidgetItem *item, int column) {
@@ -675,6 +708,46 @@ QWidget *TransitionTreeDialog::BuildTreePane()
 
 	pane->setLayout(layout);
 	return pane;
+}
+
+QWidget *TransitionTreeDialog::BuildChecker()
+{
+	/* Answers "if the program switches from A to B, which rule fires, and
+	 * why not the others?" using the engine's own resolution. */
+	m_checker = new QFrame;
+	m_checker->setObjectName("ttChecker");
+
+	auto *layout = new QVBoxLayout;
+	layout->setContentsMargins(8, 6, 8, 8);
+
+	auto *row = new QHBoxLayout;
+	row->addWidget(new QLabel(Tr("Checker.From")));
+	m_checkFrom = new QComboBox;
+	row->addWidget(m_checkFrom, 1);
+	row->addWidget(new QLabel(Tr("Checker.To")));
+	m_checkTo = new QComboBox;
+	row->addWidget(m_checkTo, 1);
+	m_checkCanvas = new QComboBox;
+	m_checkCanvas->setToolTip(Tr("Column.Canvas"));
+	row->addWidget(m_checkCanvas);
+	layout->addLayout(row);
+
+	m_checkResult = new QLabel;
+	m_checkResult->setTextFormat(Qt::RichText);
+	m_checkResult->setWordWrap(true);
+	connect(m_checkResult, &QLabel::linkActivated, this, &TransitionTreeDialog::OnCheckerLink);
+	layout->addWidget(m_checkResult);
+
+	connect(m_checkFrom, &QComboBox::currentTextChanged, this, [this]() { RefreshChecker(); });
+	connect(m_checkTo, &QComboBox::currentTextChanged, this, [this]() { RefreshChecker(); });
+	connect(m_checkCanvas, &QComboBox::currentTextChanged, this, [this]() {
+		RefreshCheckerScenes();
+		RefreshChecker();
+	});
+
+	m_checker->setLayout(layout);
+	m_checker->setVisible(false);
+	return m_checker;
 }
 
 QWidget *TransitionTreeDialog::BuildDetailPane()
@@ -817,6 +890,8 @@ QWidget *TransitionTreeDialog::BuildMarkPage()
 
 	auto *markMenu = new QMenu(this);
 	markMenu->addAction(m_duplicateMarkAction);
+	markMenu->addAction(m_moveUpAction);
+	markMenu->addAction(m_moveDownAction);
 	markMenu->addSeparator();
 	markMenu->addAction(m_deleteMarkAction);
 	m_markMenuButton = new QToolButton;
@@ -1068,6 +1143,7 @@ void TransitionTreeDialog::RefreshAll()
 	if (m_undoMark && (!preset || preset->name != m_undoPreset))
 		ClearUndo();
 
+	RefreshCheckerScenes();
 	RefreshTree();
 	RefreshDetail();
 	RefreshMasterState();
@@ -1135,12 +1211,15 @@ void TransitionTreeDialog::RefreshTree()
 {
 	m_updating = true;
 
-	/* Remember which groups were open so editing does not collapse the view. */
-	QStringList expanded;
+	/* Remember which groups the user closed, so editing does not reopen
+	 * them, while groups that are new (a new rule) start open. Groups not
+	 * currently shown keep whatever state they last had. */
 	for (int i = 0; i < m_tree->topLevelItemCount(); i++) {
 		QTreeWidgetItem *item = m_tree->topLevelItem(i);
-		if (item->isExpanded())
-			expanded << item->data(kColScenes, kGroupKeyRole).toString();
+		const QString key = item->data(kColScenes, kGroupKeyRole).toString();
+		m_collapsedGroups.removeAll(key);
+		if (!item->isExpanded())
+			m_collapsedGroups << key;
 	}
 
 	m_tree->clear();
@@ -1162,7 +1241,8 @@ void TransitionTreeDialog::RefreshTree()
 		QHash<QString, QTreeWidgetItem *> groups;
 		QHash<QString, int> groupCounts;
 
-		for (auto &mark : preset->marks) {
+		for (size_t position = 0; position < preset->marks.size(); position++) {
+			const Mark &mark = preset->marks[position];
 			const QStringList problems = MarkProblems(mark);
 			total++;
 			if (mark.enabled)
@@ -1205,6 +1285,8 @@ void TransitionTreeDialog::RefreshTree()
 			item->setToolTip(kColTransition, CandidateList(mark));
 			/* The mode only means something with more than one choice. */
 			item->setText(kColMode, usable.size() > 1 ? ModeName(mark.mode) : QString());
+			item->setText(kColOrder, QString::number(position + 1));
+			item->setTextAlignment(kColOrder, Qt::AlignRight | Qt::AlignVCenter);
 			item->setText(kColCanvas, canvas);
 			item->setData(kColScenes, kMarkIdRole, Utf8(mark.id));
 			item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
@@ -1233,7 +1315,7 @@ void TransitionTreeDialog::RefreshTree()
 			const QString key = item->data(kColScenes, kGroupKeyRole).toString();
 			item->setText(kColScenes, Tr("Tree.Group").arg(key, QString::number(groupCounts.value(key))));
 			/* Expand by default; a filtered view is most useful open. */
-			item->setExpanded(expanded.isEmpty() || expanded.contains(key) || !filter.isEmpty());
+			item->setExpanded(!m_collapsedGroups.contains(key) || !filter.isEmpty());
 		}
 	}
 
@@ -1280,7 +1362,145 @@ void TransitionTreeDialog::RefreshTree()
 
 	m_updating = false;
 
+	RefreshChecker();
 	RefreshMarkActions();
+}
+
+void TransitionTreeDialog::RefreshCheckerScenes()
+{
+	if (!m_checkerButton || !m_checkerButton->isChecked())
+		return;
+
+	const QSignalBlocker blockCanvas(m_checkCanvas);
+	const QSignalBlocker blockFrom(m_checkFrom);
+	const QSignalBlocker blockTo(m_checkTo);
+
+	const QStringList canvases = CanvasNames();
+	const QString previousCanvas = m_checkCanvas->currentText();
+	m_checkCanvas->clear();
+	m_checkCanvas->addItems(canvases);
+	const int canvasIndex =
+		m_checkCanvas->findText(previousCanvas.isEmpty() ? Utf8(MainCanvasName()) : previousCanvas);
+	if (canvasIndex >= 0)
+		m_checkCanvas->setCurrentIndex(canvasIndex);
+	m_checkCanvas->setVisible(canvases.size() > 1);
+
+	const QString canvas = m_checkCanvas->count() > 0 ? m_checkCanvas->currentText() : Utf8(MainCanvasName());
+	QStringList scenes = SceneNamesForCanvas(canvas);
+	SortNames(scenes);
+
+	/* Start from the live scene, going to the first other scene: the
+	 * question someone usually has is "what happens next?". */
+	QString from = m_checkFrom->currentText();
+	if (from.isEmpty() || !scenes.contains(from)) {
+		from.clear();
+		if (obs_source_t *current = obs_frontend_get_current_scene()) {
+			from = QString::fromUtf8(obs_source_get_name(current));
+			obs_source_release(current);
+		}
+		if (!scenes.contains(from))
+			from = scenes.isEmpty() ? QString() : scenes.first();
+	}
+	QString to = m_checkTo->currentText();
+	if (to.isEmpty() || !scenes.contains(to)) {
+		to.clear();
+		for (const QString &scene : scenes) {
+			if (scene != from) {
+				to = scene;
+				break;
+			}
+		}
+	}
+
+	m_checkFrom->clear();
+	m_checkFrom->addItems(scenes);
+	m_checkFrom->setCurrentText(from);
+	m_checkTo->clear();
+	m_checkTo->addItems(scenes);
+	m_checkTo->setCurrentText(to);
+}
+
+void TransitionTreeDialog::RefreshChecker()
+{
+	if (!m_checkerButton || !m_checkerButton->isChecked())
+		return;
+
+	Preset *preset = CurrentPreset();
+	const std::string from = m_checkFrom->currentText().toStdString();
+	const std::string to = m_checkTo->currentText().toStdString();
+	if (!preset || from.empty() || to.empty()) {
+		m_checkResult->setText(Tr("Checker.Nothing").toHtmlEscaped());
+		return;
+	}
+
+	const std::string canvas = m_checkCanvas->count() > 0 ? m_checkCanvas->currentText().toStdString()
+							      : MainCanvasName();
+	const auto matches = ExplainSwitch(*preset, canvas, from, to);
+
+	QString headline;
+	QStringList lines;
+	bool hasWinner = false;
+	QHash<QString, MatchOutcome> outcomes;
+	for (const auto &match : matches) {
+		const Mark &mark = preset->marks[match.index];
+		const QString id = Utf8(mark.id).toHtmlEscaped();
+		const QString link = QString("<a href=\"rule:%1\">%2</a>").arg(id, MarkTitle(mark).toHtmlEscaped());
+		outcomes.insert(Utf8(mark.id), match.outcome);
+
+		switch (match.outcome) {
+		case MatchOutcome::Wins:
+			hasWinner = true;
+			headline = Tr("Checker.Wins").arg(link, MarkSummary(mark).toHtmlEscaped());
+			break;
+		case MatchOutcome::LessSpecific:
+			lines << Tr("Checker.LessSpecific").arg(link);
+			break;
+		case MatchOutcome::TiedListedLater:
+			lines << Tr("Checker.Tied")
+					 .arg(link, QString::number(match.index + 1),
+					      QString("<a href=\"prefer:%1\">%2</a>")
+						      .arg(id, Tr("Checker.MakeWin").toHtmlEscaped()));
+			break;
+		case MatchOutcome::Off:
+			lines << Tr("Checker.Off").arg(link);
+			break;
+		case MatchOutcome::NoTransition:
+			lines << Tr("Checker.NoTransition").arg(link);
+			break;
+		}
+	}
+
+	if (!hasWinner) {
+		if (preset->setDefaultTransition && !preset->defaultTransition.empty())
+			headline = Tr("Checker.NoWinnerFallback")
+					   .arg(Utf8(preset->defaultTransition).toHtmlEscaped(),
+						QString::number(preset->defaultDuration));
+		else
+			headline = Tr("Checker.NoWinner").toHtmlEscaped();
+	}
+	lines.prepend(headline);
+	if (!IsTreeEnabled())
+		lines.prepend(Tr("Checker.TreeOff").toHtmlEscaped());
+
+	m_checkResult->setText(lines.join("<br>"));
+
+	/* Mirror the answer in the tree: the winner in green, the rules that
+	 * match but lose in amber. */
+	const QBrush winBrush(QColor(47, 138, 98, 90));
+	const QBrush loseBrush(QColor(229, 169, 59, 55));
+	m_updating = true;
+	QTreeWidgetItemIterator iterator(m_tree);
+	while (*iterator) {
+		QTreeWidgetItem *item = *iterator;
+		const QString id = item->data(kColScenes, kMarkIdRole).toString();
+		QBrush brush;
+		if (!id.isEmpty() && outcomes.contains(id))
+			brush = outcomes.value(id) == MatchOutcome::Wins ? winBrush : loseBrush;
+		for (int column = 0; column < kTreeColumnCount; column++)
+			item->setBackground(column, brush);
+		++iterator;
+	}
+	m_updating = false;
 }
 
 void TransitionTreeDialog::RefreshMarkActions()
@@ -1294,6 +1514,13 @@ void TransitionTreeDialog::RefreshMarkActions()
 	m_testMarkAction->setEnabled(hasMark);
 	m_toggleMarkAction->setText(hasMark && !mark->enabled ? Tr("Mark.TurnOn") : Tr("Mark.TurnOff"));
 	m_addMarkAction->setEnabled(CurrentPreset() != nullptr);
+
+	Preset *preset = CurrentPreset();
+	size_t index = 0;
+	if (hasMark && preset)
+		index = (size_t)(mark - preset->marks.data());
+	m_moveUpAction->setEnabled(hasMark && index > 0);
+	m_moveDownAction->setEnabled(hasMark && preset && index + 1 < preset->marks.size());
 }
 
 void TransitionTreeDialog::RefreshDetail()
@@ -1671,6 +1898,9 @@ void TransitionTreeDialog::ShowTreeContextMenu(const QPoint &pos)
 		menu.addAction(m_duplicateMarkAction);
 		menu.addAction(m_testMarkAction);
 		menu.addSeparator();
+		menu.addAction(m_moveUpAction);
+		menu.addAction(m_moveDownAction);
+		menu.addSeparator();
 		menu.addAction(m_deleteMarkAction);
 	}
 	menu.exec(m_tree->viewport()->mapToGlobal(pos));
@@ -1948,6 +2178,82 @@ void TransitionTreeDialog::ToggleMarkEnabled()
 
 	mark->enabled = !mark->enabled;
 	CommitChange(true);
+	RefreshDetail();
+}
+
+void TransitionTreeDialog::MoveMark(int delta)
+{
+	Preset *preset = CurrentPreset();
+	Mark *mark = SelectedMark();
+	if (!preset || !mark)
+		return;
+
+	const ptrdiff_t index = mark - preset->marks.data();
+	const ptrdiff_t target = index + delta;
+	if (target < 0 || target >= (ptrdiff_t)preset->marks.size())
+		return;
+
+	std::swap(preset->marks[(size_t)index], preset->marks[(size_t)target]);
+	CommitChange(true);
+	RefreshDetail();
+}
+
+void TransitionTreeDialog::PreferMark(const std::string &markId)
+{
+	/* Resolve a tie in this rule's favour by moving it to just above the
+	 * rule that currently wins the switch shown in the checker. */
+	Preset *preset = CurrentPreset();
+	if (!preset)
+		return;
+
+	const std::string canvas = m_checkCanvas->count() > 0 ? m_checkCanvas->currentText().toStdString()
+							      : MainCanvasName();
+	const auto matches = ExplainSwitch(*preset, canvas, m_checkFrom->currentText().toStdString(),
+					   m_checkTo->currentText().toStdString());
+
+	size_t winner = preset->marks.size();
+	size_t moving = preset->marks.size();
+	for (const auto &match : matches) {
+		if (match.outcome == MatchOutcome::Wins)
+			winner = match.index;
+		if (preset->marks[match.index].id == markId)
+			moving = match.index;
+	}
+	if (winner >= preset->marks.size() || moving >= preset->marks.size() || moving <= winner)
+		return;
+
+	Mark mark = preset->marks[moving];
+	preset->marks.erase(preset->marks.begin() + (std::ptrdiff_t)moving);
+	preset->marks.insert(preset->marks.begin() + (std::ptrdiff_t)winner, mark);
+
+	m_selectedMarkId = markId;
+	CommitChange(true);
+	RefreshDetail();
+}
+
+void TransitionTreeDialog::OnCheckerLink(const QString &link)
+{
+	const int colon = link.indexOf(':');
+	if (colon < 0)
+		return;
+	const QString kind = link.left(colon);
+	const std::string markId = link.mid(colon + 1).toStdString();
+	if (kind == "rule")
+		SelectMark(markId);
+	else if (kind == "prefer")
+		PreferMark(markId);
+}
+
+void TransitionTreeDialog::SelectMark(const std::string &markId)
+{
+	/* A rule the filter hides cannot be shown selected. */
+	if (!m_search->text().isEmpty()) {
+		m_updating = true;
+		m_search->clear();
+		m_updating = false;
+	}
+	m_selectedMarkId = markId;
+	RefreshTree();
 	RefreshDetail();
 }
 
