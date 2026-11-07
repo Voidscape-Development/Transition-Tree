@@ -23,20 +23,25 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QDialog>
 #include <QString>
 
+#include <memory>
 #include <string>
 
+class QAction;
+class QButtonGroup;
 class QCheckBox;
 class QComboBox;
-class QDoubleSpinBox;
-class QGroupBox;
+class QFrame;
 class QLabel;
 class QLineEdit;
 class QListWidget;
 class QMainWindow;
+class QPoint;
 class QPushButton;
 class QSpinBox;
 class QStackedWidget;
 class QTableWidget;
+class QTimer;
+class QToolButton;
 class QTreeWidget;
 class QTreeWidgetItem;
 
@@ -76,8 +81,13 @@ private slots:
 	void OnSearchChanged(const QString &text);
 
 private:
+	/* What the placeholder shown instead of an empty tree offers to do. */
+	enum class EmptyState { None, NoPreset, NoMarks, NoMatches };
+
 	/* --- construction helpers --- */
+	void BuildActions();
 	QWidget *BuildPresetBar();
+	QWidget *BuildOffBanner();
 	QWidget *BuildTreePane();
 	QWidget *BuildDetailPane();
 	QWidget *BuildMarkPage();
@@ -86,15 +96,22 @@ private:
 
 	/* --- refresh --- */
 	void RefreshAll();
+	void RefreshMasterState();
 	void RefreshPresetCombo();
+	void RefreshPresetActions();
 	void RefreshTree();
 	void RefreshDetail();
+	void RefreshMarkActions();
 	void RefreshMarkPage(tt::Mark &mark);
+	void RefreshMarkSummary(const tt::Mark &mark);
 	void RefreshMarkWarning(const tt::Mark &mark);
 	void RefreshPresetPage();
-	void RefreshMatcherWidgets(const tt::SceneMatcher &matcher, QComboBox *typeCombo, QListWidget *sceneList,
-				   const QString &canvas);
+	void RefreshMatcherWidgets(const tt::SceneMatcher &matcher, QButtonGroup *typeGroup, QListWidget *sceneList,
+				   QLabel *anyNote, QLabel *count, const QString &canvas);
+	void RefreshMatcherState(const tt::SceneMatcher &matcher, QListWidget *sceneList, QLabel *anyNote,
+				 QLabel *count);
 	void RefreshCandidateTable(tt::Mark &mark);
+	void RefreshCandidateShares(const tt::Mark &mark);
 
 	/* --- model access --- */
 	tt::Preset *CurrentPreset();
@@ -106,60 +123,98 @@ private:
 	void DuplicatePreset();
 	void RenamePreset();
 	void DeletePreset();
-	void ChangePresetScope(int index);
+	void ChangePresetScope(bool global);
 	void AddMark();
 	void DuplicateMark();
 	void DeleteMark();
+	void UndoDeleteMark();
+	void ClearUndo();
 	void ToggleMarkEnabled();
 	void TestMark();
 	void AddCandidate();
-	void RemoveCandidate();
-	void MoveCandidate(int delta);
+	void RemoveCandidate(int row);
+	void MoveCandidate(int row, int delta);
 	void ImportPresets();
 	void ExportPresets();
 	void CreateTransition();
-	void ReadMatcherFromWidgets(tt::SceneMatcher &matcher, QComboBox *typeCombo, QListWidget *sceneList);
+	void ShowTreeContextMenu(const QPoint &pos);
+	void ReadMatcherFromWidgets(tt::SceneMatcher &matcher, QButtonGroup *typeGroup, QListWidget *sceneList);
 
 	QStringList SceneNamesForCanvas(const QString &canvas) const;
 	QStringList TransitionNames() const;
 	QStringList CanvasNames() const;
 	void WarnAboutTransitionTable();
 
-	/* --- widgets --- */
+	/* --- actions shared by menus, the context menu and shortcuts --- */
+	QAction *m_addMarkAction = nullptr;
+	QAction *m_duplicateMarkAction = nullptr;
+	QAction *m_deleteMarkAction = nullptr;
+	QAction *m_toggleMarkAction = nullptr;
+	QAction *m_testMarkAction = nullptr;
+
+	QAction *m_duplicatePresetAction = nullptr;
+	QAction *m_renamePresetAction = nullptr;
+	QAction *m_deletePresetAction = nullptr;
+	QAction *m_exportAction = nullptr;
+	QAction *m_scopeLocalAction = nullptr;
+	QAction *m_scopeGlobalAction = nullptr;
+
+	/* --- header --- */
+	QPushButton *m_enabledButton = nullptr;
 	QComboBox *m_presetCombo = nullptr;
-	QComboBox *m_scopeCombo = nullptr;
-	QCheckBox *m_enabledCheck = nullptr;
+	QToolButton *m_presetMenuButton = nullptr;
+	QFrame *m_offBanner = nullptr;
+
+	/* --- tree pane --- */
 	QLineEdit *m_search = nullptr;
+	QStackedWidget *m_treeStack = nullptr;
 	QTreeWidget *m_tree = nullptr;
+	QLabel *m_emptyLabel = nullptr;
+	QPushButton *m_emptyButton = nullptr;
+	EmptyState m_emptyState = EmptyState::None;
+	QFrame *m_undoBar = nullptr;
+	QLabel *m_undoLabel = nullptr;
+	QTimer *m_undoTimer = nullptr;
+	QLabel *m_treeFooter = nullptr;
+
 	QStackedWidget *m_detail = nullptr;
 
-	QPushButton *m_duplicateMarkButton = nullptr;
-	QPushButton *m_deleteMarkButton = nullptr;
-	QPushButton *m_toggleMarkButton = nullptr;
-	QPushButton *m_testMarkButton = nullptr;
-
-	/* Mark page */
-	QComboBox *m_fromType = nullptr;
-	QListWidget *m_fromScenes = nullptr;
-	QComboBox *m_toType = nullptr;
-	QListWidget *m_toScenes = nullptr;
-	QComboBox *m_canvasCombo = nullptr;
-	QComboBox *m_modeCombo = nullptr;
+	/* --- mark page --- */
+	QLabel *m_markTitle = nullptr;
+	QLabel *m_markSentence = nullptr;
 	QCheckBox *m_markEnabled = nullptr;
+	QPushButton *m_testMarkButton = nullptr;
+	QToolButton *m_markMenuButton = nullptr;
 	QLabel *m_markWarning = nullptr;
+	QWidget *m_canvasRow = nullptr;
+	QComboBox *m_canvasCombo = nullptr;
+	QButtonGroup *m_fromType = nullptr;
+	QListWidget *m_fromScenes = nullptr;
+	QLabel *m_fromAnyNote = nullptr;
+	QLabel *m_fromCount = nullptr;
+	QButtonGroup *m_toType = nullptr;
+	QListWidget *m_toScenes = nullptr;
+	QLabel *m_toAnyNote = nullptr;
+	QLabel *m_toCount = nullptr;
+	QWidget *m_modeRow = nullptr;
+	QComboBox *m_modeCombo = nullptr;
 	QTableWidget *m_candidates = nullptr;
-	QPushButton *m_removeCandidateButton = nullptr;
-	QPushButton *m_moveUpButton = nullptr;
-	QPushButton *m_moveDownButton = nullptr;
 
-	/* Preset page */
+	/* --- preset page --- */
+	QLabel *m_presetTitle = nullptr;
 	QLabel *m_presetSummary = nullptr;
 	QCheckBox *m_setDefaultTransition = nullptr;
 	QComboBox *m_defaultTransition = nullptr;
 	QSpinBox *m_defaultDuration = nullptr;
+	QPushButton *m_presetExportButton = nullptr;
 
 	/* Selected mark id, so selection survives a tree rebuild. */
 	std::string m_selectedMarkId;
+
+	/* The most recently deleted mark, held until the undo bar times out. */
+	std::unique_ptr<tt::Mark> m_undoMark;
+	std::string m_undoPreset;
+	size_t m_undoIndex = 0;
 
 	/* Guards widget signal handlers while the UI is being repopulated. */
 	bool m_updating = false;
