@@ -25,30 +25,43 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/platform.h>
 
 #include <QAbstractButton>
+#include <QAction>
+#include <QActionGroup>
+#include <QButtonGroup>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFont>
 #include <QFormLayout>
+#include <QFrame>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHash>
 #include <QHeaderView>
 #include <QInputDialog>
+#include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QMainWindow>
+#include <QMenu>
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QPushButton>
+#include <QScrollArea>
+#include <QShortcut>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStringList>
+#include <QStyle>
 #include <QTableWidget>
+#include <QTableWidgetItem>
+#include <QTimer>
+#include <QToolButton>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
 #include <QTreeWidgetItemIterator>
@@ -68,6 +81,40 @@ bool g_warnedAboutTransitionTable = false;
 
 /* Roles used to hang model identity off tree items. */
 constexpr int kMarkIdRole = Qt::UserRole + 1;
+constexpr int kGroupKeyRole = Qt::UserRole + 2;
+
+/* How long a deleted mark can still be restored from the undo bar. */
+constexpr int kUndoTimeoutMs = 8000;
+
+enum TreeColumn { kColScenes = 0, kColTransition, kColMode, kColOrder, kColCanvas, kTreeColumnCount };
+
+enum CandidateColumn {
+	kCandTransition = 0,
+	kCandDuration,
+	kCandWeight,
+	kCandShare,
+	kCandEnabled,
+	kCandActions,
+	kCandColumnCount
+};
+
+/* Kept deliberately small so OBS's own theme still drives almost everything.
+ * Colours are chosen to read on both the dark and light OBS themes. */
+const char *kStyleSheet = R"(
+QPushButton#ttMaster { padding: 4px 14px; border-radius: 13px; font-weight: bold; }
+QPushButton#ttMaster:checked { background-color: #1f4d39; border: 1px solid #2f8a62; color: #d2f5e3; }
+QFrame#ttBanner, QLabel#ttWarning {
+	background-color: rgba(229, 169, 59, 0.16);
+	border: 1px solid rgba(229, 169, 59, 0.6);
+	border-radius: 4px;
+}
+QLabel#ttWarning { padding: 6px 8px; }
+QFrame#ttChecker { background-color: rgba(74, 114, 240, 0.12); border: 1px solid rgba(74, 114, 240, 0.45); border-radius: 4px; }
+QFrame#ttUndoBar { background-color: rgba(127, 127, 127, 0.18); border-radius: 4px; }
+QPushButton#ttTest { color: #e05a5a; }
+QLabel#ttTitle { font-size: 14pt; font-weight: bold; }
+QLabel#ttDim { color: #8b8b96; }
+)";
 
 QString Tr(const char *key)
 {
@@ -94,6 +141,19 @@ QColor InvalidColor()
 	return QColor(0xE0, 0x5A, 0x5A);
 }
 
+QColor DimColor()
+{
+	return QColor(0x8B, 0x8B, 0x96);
+}
+
+QLabel *DimLabel(const QString &text = QString())
+{
+	auto *label = new QLabel(text);
+	label->setObjectName("ttDim");
+	label->setWordWrap(true);
+	return label;
+}
+
 /* OBS hands out scenes and transitions in dock order, which is arbitrary once
  * a collection grows. Lists the user has to hunt through are sorted the way
  * they would sort them by hand: case-insensitively, with case only breaking
@@ -106,14 +166,137 @@ void SortNames(QStringList &names)
 	});
 }
 
+QString Utf8(const std::string &text)
+{
+	return QString::fromUtf8(text.c_str());
+}
+
+std::vector<std::string> MissingScenes(const Mark &mark)
+{
+	auto missing = mark.from.MissingScenes();
+	for (const auto &scene : mark.to.MissingScenes())
+		missing.push_back(scene);
+	return missing;
+}
+
+/* Every reason a mark cannot fire, in the words shown to the user. */
+QStringList MarkProblems(const Mark &mark)
+{
+	QStringList problems;
+
+	const auto missing = MissingScenes(mark);
+	if (!missing.empty()) {
+		QStringList names;
+		for (const auto &scene : missing)
+			names << Utf8(scene);
+		problems << Tr("Warning.MissingScenes").arg(names.join(", "));
+	}
+	if (mark.from.IsEmpty() || mark.to.IsEmpty())
+		problems << Tr("Warning.NoScenesSelected");
+	if (mark.UsableCandidates().empty())
+		problems << Tr("Warning.NoUsableCandidates");
+
+	return problems;
+}
+
+/* The transition column of the tree: the first usable transition and its
+ * duration, plus how many more the mark can pick from. */
 QString MarkSummary(const Mark &mark)
 {
 	const auto usable = mark.UsableCandidates();
 	if (mark.candidates.empty())
 		return Tr("Mark.NoTransitions");
+	if (usable.empty())
+		return Tr("Mark.NoneOn");
+
+	const Candidate &first = mark.candidates[usable.front()];
+	const QString summary =
+		Tr("Mark.TransitionSummary").arg(Utf8(first.transition), QString::number(first.duration));
 	if (usable.size() == 1)
-		return QString::fromUtf8(mark.candidates[usable.front()].transition.c_str());
-	return Tr("Mark.TransitionCount").arg(usable.size()).arg(mark.candidates.size());
+		return summary;
+	return Tr("Mark.TransitionMore").arg(summary, QString::number(usable.size() - 1));
+}
+
+QString CandidateList(const Mark &mark)
+{
+	QStringList lines;
+	for (const auto &candidate : mark.candidates) {
+		QString line = Tr("Mark.TransitionSummary")
+				       .arg(Utf8(candidate.transition), QString::number(candidate.duration));
+		if (!candidate.enabled)
+			line = Tr("Candidate.OffSuffix").arg(line);
+		lines << line;
+	}
+	return lines.join("\n");
+}
+
+QString JoinWithOr(const std::vector<std::string> &scenes)
+{
+	QStringList names;
+	for (const auto &scene : scenes)
+		names << Utf8(scene);
+	if (names.size() < 2)
+		return names.join(QString());
+	const QString last = names.takeLast();
+	return Tr("Sentence.OrJoin").arg(names.join(", "), last);
+}
+
+QString SidePhrase(const SceneMatcher &matcher)
+{
+	switch (matcher.type) {
+	case MatchType::Any:
+		return Tr("Sentence.AnyScene");
+	case MatchType::AnyExcept:
+		if (matcher.scenes.empty())
+			return Tr("Sentence.AnyScene");
+		return Tr("Sentence.AnyExcept").arg(JoinWithOr(matcher.scenes));
+	case MatchType::Scenes:
+		break;
+	}
+	if (matcher.scenes.empty())
+		return Tr("Sentence.NoScene");
+	return JoinWithOr(matcher.scenes);
+}
+
+/* The mark as one plain-English sentence, shown under the editor title. */
+QString MarkSentence(const Mark &mark)
+{
+	const auto usable = mark.UsableCandidates();
+
+	QString action;
+	if (usable.empty()) {
+		action = Tr("Sentence.Nothing");
+	} else if (usable.size() == 1) {
+		const Candidate &candidate = mark.candidates[usable.front()];
+		action = Tr("Sentence.One").arg(Utf8(candidate.transition), QString::number(candidate.duration));
+	} else {
+		const char *key = "Sentence.Sequential";
+		switch (mark.mode) {
+		case SelectionMode::Sequential:
+			key = "Sentence.Sequential";
+			break;
+		case SelectionMode::Random:
+			key = "Sentence.Random";
+			break;
+		case SelectionMode::RandomNoRepeat:
+			key = "Sentence.RandomNoRepeat";
+			break;
+		case SelectionMode::Weighted:
+			key = "Sentence.Weighted";
+			break;
+		}
+		action = Tr(key).arg(usable.size());
+	}
+
+	QString sentence = Tr("Sentence.Base").arg(SidePhrase(mark.from), SidePhrase(mark.to), action);
+	if (!mark.enabled)
+		sentence += " " + Tr("Sentence.Off");
+	return sentence;
+}
+
+QString MarkTitle(const Mark &mark)
+{
+	return Tr("Mark.Title").arg(Utf8(mark.from.Describe()), Utf8(mark.to.Describe()));
 }
 
 } // namespace
@@ -204,18 +387,26 @@ TransitionTreeDialog::TransitionTreeDialog(QMainWindow *parent) : QDialog(parent
 
 	setWindowTitle(Tr("TransitionTree"));
 	setSizeGripEnabled(true);
-	setMinimumSize(900, 520);
+	setMinimumSize(960, 560);
 	if (g_savedWidth > 0 && g_savedHeight > 0)
 		resize(g_savedWidth, g_savedHeight);
+	setStyleSheet(kStyleSheet);
+
+	BuildActions();
 
 	auto *splitter = new QSplitter(Qt::Horizontal);
 	splitter->addWidget(BuildTreePane());
 	splitter->addWidget(BuildDetailPane());
-	splitter->setStretchFactor(0, 3);
-	splitter->setStretchFactor(1, 2);
+	splitter->setStretchFactor(0, 1);
+	splitter->setStretchFactor(1, 1);
+	splitter->setChildrenCollapsible(false);
+	/* Roughly even, so the tree has room for scene names. setSizes scales
+	 * these to the real width. */
+	splitter->setSizes({480, 520});
 
 	auto *layout = new QVBoxLayout;
 	layout->addWidget(BuildPresetBar());
+	layout->addWidget(BuildOffBanner());
 	layout->addWidget(splitter, 1);
 	layout->addWidget(BuildBottomBar());
 	setLayout(layout);
@@ -232,53 +423,152 @@ TransitionTreeDialog::~TransitionTreeDialog()
 		g_instance = nullptr;
 }
 
+void TransitionTreeDialog::BuildActions()
+{
+	m_addMarkAction = new QAction(Tr("Mark.Add"), this);
+	m_addMarkAction->setToolTip(Tr("Mark.Add.Tooltip"));
+	m_addMarkAction->setShortcut(QKeySequence::New);
+	m_addMarkAction->setShortcutContext(Qt::WindowShortcut);
+	connect(m_addMarkAction, &QAction::triggered, this, &TransitionTreeDialog::AddMark);
+	addAction(m_addMarkAction);
+
+	/* Mark shortcuts only fire while the tree has focus, so Delete in the
+	 * search box or a spin box keeps its ordinary meaning. They are added
+	 * to the tree once it exists. */
+	m_duplicateMarkAction = new QAction(Tr("Mark.Duplicate"), this);
+	m_duplicateMarkAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_D));
+	m_duplicateMarkAction->setShortcutContext(Qt::WidgetShortcut);
+	connect(m_duplicateMarkAction, &QAction::triggered, this, &TransitionTreeDialog::DuplicateMark);
+
+	m_deleteMarkAction = new QAction(Tr("Mark.Delete"), this);
+	m_deleteMarkAction->setShortcuts({QKeySequence(QKeySequence::Delete), QKeySequence(Qt::Key_Backspace)});
+	m_deleteMarkAction->setShortcutContext(Qt::WidgetShortcut);
+	connect(m_deleteMarkAction, &QAction::triggered, this, &TransitionTreeDialog::DeleteMark);
+
+	m_toggleMarkAction = new QAction(Tr("Mark.TurnOff"), this);
+	connect(m_toggleMarkAction, &QAction::triggered, this, &TransitionTreeDialog::ToggleMarkEnabled);
+
+	m_testMarkAction = new QAction(Tr("Mark.TestEllipsis"), this);
+	m_testMarkAction->setToolTip(Tr("Mark.Test.Tooltip"));
+	connect(m_testMarkAction, &QAction::triggered, this, &TransitionTreeDialog::TestMark);
+
+	/* Order only decides ties between equally specific rules, but it is
+	 * real, so it can be seen (the # column) and changed. */
+	m_moveUpAction = new QAction(Tr("Mark.MoveUp"), this);
+	m_moveUpAction->setShortcut(QKeySequence(Qt::ALT | Qt::Key_Up));
+	m_moveUpAction->setShortcutContext(Qt::WidgetShortcut);
+	connect(m_moveUpAction, &QAction::triggered, this, [this]() { MoveMark(-1); });
+
+	m_moveDownAction = new QAction(Tr("Mark.MoveDown"), this);
+	m_moveDownAction->setShortcut(QKeySequence(Qt::ALT | Qt::Key_Down));
+	m_moveDownAction->setShortcutContext(Qt::WidgetShortcut);
+	connect(m_moveDownAction, &QAction::triggered, this, [this]() { MoveMark(1); });
+
+	auto *find = new QShortcut(QKeySequence::Find, this);
+	connect(find, &QShortcut::activated, this, [this]() {
+		m_search->setFocus(Qt::ShortcutFocusReason);
+		m_search->selectAll();
+	});
+}
+
 QWidget *TransitionTreeDialog::BuildPresetBar()
 {
 	auto *bar = new QWidget;
 	auto *layout = new QHBoxLayout;
 	layout->setContentsMargins(0, 0, 0, 0);
 
+	/* The master switch leads the header: it decides whether anything else
+	 * in this window has an effect at all. */
+	m_enabledButton = new QPushButton;
+	m_enabledButton->setObjectName("ttMaster");
+	m_enabledButton->setCheckable(true);
+	m_enabledButton->setAutoDefault(false);
+	m_enabledButton->setToolTip(Tr("TreeEnabled.Tooltip"));
+	connect(m_enabledButton, &QPushButton::toggled, this, [this](bool checked) {
+		if (m_updating)
+			return;
+		SetTreeEnabled(checked);
+		RefreshMasterState();
+	});
+	layout->addWidget(m_enabledButton);
+	layout->addSpacing(12);
+
 	layout->addWidget(new QLabel(Tr("Preset")));
 
 	m_presetCombo = new QComboBox;
-	m_presetCombo->setMinimumWidth(200);
+	m_presetCombo->setMinimumWidth(220);
 	m_presetCombo->setToolTip(Tr("Preset.Tooltip"));
 	connect(m_presetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
 		&TransitionTreeDialog::OnPresetChanged);
 	layout->addWidget(m_presetCombo);
 
-	m_scopeCombo = new QComboBox;
-	m_scopeCombo->addItem(Tr("Scope.Local"));
-	m_scopeCombo->addItem(Tr("Scope.Global"));
-	m_scopeCombo->setToolTip(Tr("Scope.Tooltip"));
-	connect(m_scopeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-		[this](int index) { ChangePresetScope(index); });
-	layout->addWidget(m_scopeCombo);
-
-	auto addButton = [&](const char *key, void (TransitionTreeDialog::*slot)()) {
-		auto *button = new QPushButton(Tr(key));
-		connect(button, &QPushButton::clicked, this, slot);
-		layout->addWidget(button);
-		return button;
+	auto *menu = new QMenu(this);
+	auto addMenuAction = [&](const char *key, void (TransitionTreeDialog::*slot)()) {
+		QAction *action = menu->addAction(Tr(key));
+		connect(action, &QAction::triggered, this, slot);
+		return action;
 	};
-	addButton("Preset.New", &TransitionTreeDialog::AddPreset);
-	addButton("Preset.Duplicate", &TransitionTreeDialog::DuplicatePreset);
-	addButton("Preset.Rename", &TransitionTreeDialog::RenamePreset);
-	addButton("Preset.Delete", &TransitionTreeDialog::DeletePreset);
+	addMenuAction("Preset.New", &TransitionTreeDialog::AddPreset);
+	m_duplicatePresetAction = addMenuAction("Preset.Duplicate", &TransitionTreeDialog::DuplicatePreset);
+	m_renamePresetAction = addMenuAction("Preset.Rename", &TransitionTreeDialog::RenamePreset);
+	menu->addSeparator();
+
+	auto *scopeGroup = new QActionGroup(menu);
+	scopeGroup->setExclusive(true);
+	m_scopeLocalAction = menu->addAction(Tr("Scope.LocalMenu"));
+	m_scopeGlobalAction = menu->addAction(Tr("Scope.GlobalMenu"));
+	for (QAction *action : {m_scopeLocalAction, m_scopeGlobalAction}) {
+		action->setCheckable(true);
+		action->setToolTip(Tr("Scope.Tooltip"));
+		scopeGroup->addAction(action);
+	}
+	connect(m_scopeLocalAction, &QAction::triggered, this, [this]() { ChangePresetScope(false); });
+	connect(m_scopeGlobalAction, &QAction::triggered, this, [this]() { ChangePresetScope(true); });
+	menu->setToolTipsVisible(true);
+	menu->addSeparator();
+
+	addMenuAction("Import", &TransitionTreeDialog::ImportPresets);
+	m_exportAction = addMenuAction("Export", &TransitionTreeDialog::ExportPresets);
+	menu->addSeparator();
+	m_deletePresetAction = addMenuAction("Preset.Delete", &TransitionTreeDialog::DeletePreset);
+
+	m_presetMenuButton = new QToolButton;
+	m_presetMenuButton->setText(Tr("Menu.Glyph"));
+	m_presetMenuButton->setToolTip(Tr("Preset.Menu"));
+	m_presetMenuButton->setPopupMode(QToolButton::InstantPopup);
+	m_presetMenuButton->setMenu(menu);
+	layout->addWidget(m_presetMenuButton);
 
 	layout->addStretch(1);
-
-	m_enabledCheck = new QCheckBox(Tr("TreeEnabled"));
-	m_enabledCheck->setToolTip(Tr("TreeEnabled.Tooltip"));
-	connect(m_enabledCheck, &QCheckBox::toggled, this, [this](bool checked) {
-		if (m_updating)
-			return;
-		SetTreeEnabled(checked);
-	});
-	layout->addWidget(m_enabledCheck);
+	QLabel *liveHint = DimLabel(Tr("LiveHint"));
+	liveHint->setWordWrap(false);
+	layout->addWidget(liveHint);
 
 	bar->setLayout(layout);
 	return bar;
+}
+
+QWidget *TransitionTreeDialog::BuildOffBanner()
+{
+	m_offBanner = new QFrame;
+	m_offBanner->setObjectName("ttBanner");
+
+	auto *layout = new QHBoxLayout;
+	layout->setContentsMargins(10, 6, 6, 6);
+
+	auto *text = new QLabel(Tr("TreeOff.Banner"));
+	text->setWordWrap(true);
+	text->setTextFormat(Qt::RichText);
+	layout->addWidget(text, 1);
+
+	auto *turnOn = new QPushButton(Tr("TreeOff.TurnOn"));
+	turnOn->setAutoDefault(false);
+	connect(turnOn, &QPushButton::clicked, this, []() { SetTreeEnabled(true); });
+	layout->addWidget(turnOn);
+
+	m_offBanner->setLayout(layout);
+	m_offBanner->setVisible(false);
+	return m_offBanner;
 }
 
 QWidget *TransitionTreeDialog::BuildTreePane()
@@ -290,72 +580,174 @@ QWidget *TransitionTreeDialog::BuildTreePane()
 	/* The search box only ever filters the view. Adding a mark is a separate
 	 * button, so narrowing the list can never hide the controls needed to
 	 * create one. */
-	auto *searchRow = new QHBoxLayout;
-	searchRow->addWidget(new QLabel(Tr("Search")));
+	auto *toolbar = new QHBoxLayout;
 	m_search = new QLineEdit;
 	m_search->setClearButtonEnabled(true);
 	m_search->setPlaceholderText(Tr("Search.Placeholder"));
 	connect(m_search, &QLineEdit::textChanged, this, &TransitionTreeDialog::OnSearchChanged);
-	searchRow->addWidget(m_search, 1);
-	layout->addLayout(searchRow);
+	toolbar->addWidget(m_search, 1);
+
+	auto *addMark = new QPushButton(Tr("Mark.Add"));
+	addMark->setToolTip(Tr("Mark.Add.Tooltip"));
+	addMark->setAutoDefault(false);
+	connect(addMark, &QPushButton::clicked, this, &TransitionTreeDialog::AddMark);
+	toolbar->addWidget(addMark);
+
+	m_checkerButton = new QPushButton(Tr("Checker.Toggle"));
+	m_checkerButton->setToolTip(Tr("Checker.Tooltip"));
+	m_checkerButton->setCheckable(true);
+	m_checkerButton->setAutoDefault(false);
+	connect(m_checkerButton, &QPushButton::toggled, this, [this](bool checked) {
+		m_checker->setVisible(checked);
+		if (checked)
+			RefreshCheckerScenes();
+		/* Rebuilding applies or clears the row highlights. */
+		RefreshTree();
+	});
+	toolbar->addWidget(m_checkerButton);
+	layout->addLayout(toolbar);
+	layout->addWidget(BuildChecker());
 
 	m_tree = new QTreeWidget;
-	m_tree->setColumnCount(5);
-	m_tree->setHeaderLabels({Tr("Column.Scenes"), Tr("Column.Transitions"), Tr("Column.Mode"), Tr("Column.Canvas"),
-				 Tr("Column.Enabled")});
+	m_tree->setColumnCount(kTreeColumnCount);
+	m_tree->setHeaderLabels({Tr("Column.Scenes"), Tr("Column.Transition"), Tr("Column.Mode"), Tr("Column.Order"),
+				 Tr("Column.Canvas")});
+	m_tree->headerItem()->setToolTip(kColOrder, Tr("Column.Order.Tooltip"));
 	m_tree->setRootIsDecorated(true);
 	m_tree->setAlternatingRowColors(true);
 	m_tree->setSelectionBehavior(QAbstractItemView::SelectRows);
 	m_tree->header()->setStretchLastSection(false);
-	m_tree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
-	m_tree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-	m_tree->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-	m_tree->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-	m_tree->header()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+	m_tree->header()->setSectionResizeMode(kColScenes, QHeaderView::Stretch);
+	m_tree->header()->setSectionResizeMode(kColTransition, QHeaderView::ResizeToContents);
+	m_tree->header()->setSectionResizeMode(kColMode, QHeaderView::ResizeToContents);
+	m_tree->header()->setSectionResizeMode(kColOrder, QHeaderView::ResizeToContents);
+	m_tree->header()->setSectionResizeMode(kColCanvas, QHeaderView::ResizeToContents);
+	m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
+	m_tree->addAction(m_duplicateMarkAction);
+	m_tree->addAction(m_deleteMarkAction);
+	m_tree->addAction(m_moveUpAction);
+	m_tree->addAction(m_moveDownAction);
+	connect(m_tree, &QTreeWidget::customContextMenuRequested, this, &TransitionTreeDialog::ShowTreeContextMenu);
 	connect(m_tree, &QTreeWidget::itemSelectionChanged, this, &TransitionTreeDialog::OnTreeSelectionChanged);
 	connect(m_tree, &QTreeWidget::itemChanged, this, [this](QTreeWidgetItem *item, int column) {
-		if (m_updating || column != 4)
+		if (m_updating || column != kColScenes)
 			return;
-		const std::string markId = item->data(0, kMarkIdRole).toString().toStdString();
+		const std::string markId = item->data(kColScenes, kMarkIdRole).toString().toStdString();
 		Preset *preset = CurrentPreset();
 		if (!preset || markId.empty())
 			return;
 		Mark *mark = preset->FindMark(markId);
-		if (!mark)
+		const bool enabled = item->checkState(kColScenes) == Qt::Checked;
+		if (!mark || mark->enabled == enabled)
 			return;
-		mark->enabled = item->checkState(4) == Qt::Checked;
-		CommitChange(true);
+		mark->enabled = enabled;
+		/* The tree is rebuilt on commit, which would delete the item that
+		 * is still emitting this signal, so let the signal finish first. */
+		QMetaObject::invokeMethod(
+			this,
+			[this]() {
+				CommitChange(true);
+				RefreshDetail();
+			},
+			Qt::QueuedConnection);
 	});
-	layout->addWidget(m_tree, 1);
 
-	auto *buttons = new QHBoxLayout;
-	auto *addMark = new QPushButton(Tr("Mark.Add"));
-	addMark->setToolTip(Tr("Mark.Add.Tooltip"));
-	connect(addMark, &QPushButton::clicked, this, &TransitionTreeDialog::AddMark);
-	buttons->addWidget(addMark);
+	auto *empty = new QWidget;
+	auto *emptyLayout = new QVBoxLayout;
+	emptyLayout->addStretch(1);
+	m_emptyLabel = DimLabel();
+	m_emptyLabel->setAlignment(Qt::AlignCenter);
+	emptyLayout->addWidget(m_emptyLabel);
+	m_emptyButton = new QPushButton;
+	m_emptyButton->setAutoDefault(false);
+	connect(m_emptyButton, &QPushButton::clicked, this, [this]() {
+		switch (m_emptyState) {
+		case EmptyState::NoPreset:
+			AddPreset();
+			break;
+		case EmptyState::NoMarks:
+			AddMark();
+			break;
+		case EmptyState::NoMatches:
+			m_search->clear();
+			break;
+		case EmptyState::None:
+			break;
+		}
+	});
+	emptyLayout->addWidget(m_emptyButton, 0, Qt::AlignHCenter);
+	emptyLayout->addStretch(2);
+	empty->setLayout(emptyLayout);
 
-	m_duplicateMarkButton = new QPushButton(Tr("Mark.Duplicate"));
-	connect(m_duplicateMarkButton, &QPushButton::clicked, this, &TransitionTreeDialog::DuplicateMark);
-	buttons->addWidget(m_duplicateMarkButton);
+	m_treeStack = new QStackedWidget;
+	m_treeStack->addWidget(m_tree);
+	m_treeStack->addWidget(empty);
+	layout->addWidget(m_treeStack, 1);
 
-	m_deleteMarkButton = new QPushButton(Tr("Mark.Delete"));
-	connect(m_deleteMarkButton, &QPushButton::clicked, this, &TransitionTreeDialog::DeleteMark);
-	buttons->addWidget(m_deleteMarkButton);
+	m_undoBar = new QFrame;
+	m_undoBar->setObjectName("ttUndoBar");
+	auto *undoLayout = new QHBoxLayout;
+	undoLayout->setContentsMargins(10, 4, 4, 4);
+	m_undoLabel = new QLabel;
+	undoLayout->addWidget(m_undoLabel, 1);
+	auto *undoButton = new QPushButton(Tr("Mark.Undo"));
+	undoButton->setAutoDefault(false);
+	connect(undoButton, &QPushButton::clicked, this, &TransitionTreeDialog::UndoDeleteMark);
+	undoLayout->addWidget(undoButton);
+	m_undoBar->setLayout(undoLayout);
+	m_undoBar->setVisible(false);
+	layout->addWidget(m_undoBar);
 
-	m_toggleMarkButton = new QPushButton(Tr("Mark.Toggle"));
-	connect(m_toggleMarkButton, &QPushButton::clicked, this, &TransitionTreeDialog::ToggleMarkEnabled);
-	buttons->addWidget(m_toggleMarkButton);
+	m_undoTimer = new QTimer(this);
+	m_undoTimer->setSingleShot(true);
+	m_undoTimer->setInterval(kUndoTimeoutMs);
+	connect(m_undoTimer, &QTimer::timeout, this, &TransitionTreeDialog::ClearUndo);
 
-	m_testMarkButton = new QPushButton(Tr("Mark.Test"));
-	m_testMarkButton->setToolTip(Tr("Mark.Test.Tooltip"));
-	connect(m_testMarkButton, &QPushButton::clicked, this, &TransitionTreeDialog::TestMark);
-	buttons->addWidget(m_testMarkButton);
-
-	buttons->addStretch(1);
-	layout->addLayout(buttons);
+	m_treeFooter = DimLabel();
+	layout->addWidget(m_treeFooter);
 
 	pane->setLayout(layout);
 	return pane;
+}
+
+QWidget *TransitionTreeDialog::BuildChecker()
+{
+	/* Answers "if the program switches from A to B, which rule fires, and
+	 * why not the others?" using the engine's own resolution. */
+	m_checker = new QFrame;
+	m_checker->setObjectName("ttChecker");
+
+	auto *layout = new QVBoxLayout;
+	layout->setContentsMargins(8, 6, 8, 8);
+
+	auto *row = new QHBoxLayout;
+	row->addWidget(new QLabel(Tr("Checker.From")));
+	m_checkFrom = new QComboBox;
+	row->addWidget(m_checkFrom, 1);
+	row->addWidget(new QLabel(Tr("Checker.To")));
+	m_checkTo = new QComboBox;
+	row->addWidget(m_checkTo, 1);
+	m_checkCanvas = new QComboBox;
+	m_checkCanvas->setToolTip(Tr("Column.Canvas"));
+	row->addWidget(m_checkCanvas);
+	layout->addLayout(row);
+
+	m_checkResult = new QLabel;
+	m_checkResult->setTextFormat(Qt::RichText);
+	m_checkResult->setWordWrap(true);
+	connect(m_checkResult, &QLabel::linkActivated, this, &TransitionTreeDialog::OnCheckerLink);
+	layout->addWidget(m_checkResult);
+
+	connect(m_checkFrom, &QComboBox::currentTextChanged, this, [this]() { RefreshChecker(); });
+	connect(m_checkTo, &QComboBox::currentTextChanged, this, [this]() { RefreshChecker(); });
+	connect(m_checkCanvas, &QComboBox::currentTextChanged, this, [this]() {
+		RefreshCheckerScenes();
+		RefreshChecker();
+	});
+
+	m_checker->setLayout(layout);
+	m_checker->setVisible(false);
+	return m_checker;
 }
 
 QWidget *TransitionTreeDialog::BuildDetailPane()
@@ -363,7 +755,14 @@ QWidget *TransitionTreeDialog::BuildDetailPane()
 	m_detail = new QStackedWidget;
 	m_detail->addWidget(BuildPresetPage());
 	m_detail->addWidget(BuildMarkPage());
-	return m_detail;
+
+	/* The mark editor can outgrow a short window; scroll rather than
+	 * squeezing the scene lists. */
+	auto *scroll = new QScrollArea;
+	scroll->setWidgetResizable(true);
+	scroll->setFrameShape(QFrame::NoFrame);
+	scroll->setWidget(m_detail);
+	return scroll;
 }
 
 QWidget *TransitionTreeDialog::BuildPresetPage()
@@ -371,8 +770,12 @@ QWidget *TransitionTreeDialog::BuildPresetPage()
 	auto *page = new QWidget;
 	auto *layout = new QVBoxLayout;
 
-	m_presetSummary = new QLabel;
-	m_presetSummary->setWordWrap(true);
+	m_presetTitle = new QLabel;
+	m_presetTitle->setObjectName("ttTitle");
+	m_presetTitle->setWordWrap(true);
+	layout->addWidget(m_presetTitle);
+
+	m_presetSummary = DimLabel();
 	layout->addWidget(m_presetSummary);
 
 	auto *group = new QGroupBox(Tr("Preset.DefaultTransition"));
@@ -405,7 +808,7 @@ QWidget *TransitionTreeDialog::BuildPresetPage()
 		ApplyPresetDefaultTransition();
 		CommitChange(false);
 	});
-	form->addRow(Tr("Column.Transitions"), m_defaultTransition);
+	form->addRow(Tr("Column.Transition"), m_defaultTransition);
 
 	m_defaultDuration = new QSpinBox;
 	m_defaultDuration->setRange(0, 20000);
@@ -426,9 +829,19 @@ QWidget *TransitionTreeDialog::BuildPresetPage()
 	group->setLayout(form);
 	layout->addWidget(group);
 
-	auto *hint = new QLabel(Tr("Preset.Hint"));
-	hint->setWordWrap(true);
-	layout->addWidget(hint);
+	layout->addWidget(DimLabel(Tr("Preset.Hint")));
+
+	auto *share = new QHBoxLayout;
+	auto *importButton = new QPushButton(Tr("Import"));
+	importButton->setAutoDefault(false);
+	connect(importButton, &QPushButton::clicked, this, &TransitionTreeDialog::ImportPresets);
+	share->addWidget(importButton);
+	m_presetExportButton = new QPushButton(Tr("Export"));
+	m_presetExportButton->setAutoDefault(false);
+	connect(m_presetExportButton, &QPushButton::clicked, this, &TransitionTreeDialog::ExportPresets);
+	share->addWidget(m_presetExportButton);
+	share->addStretch(1);
+	layout->addLayout(share);
 
 	layout->addStretch(1);
 	page->setLayout(layout);
@@ -440,27 +853,138 @@ QWidget *TransitionTreeDialog::BuildMarkPage()
 	auto *page = new QWidget;
 	auto *layout = new QVBoxLayout;
 
-	auto buildMatcherGroup = [this](const char *titleKey, QComboBox *&typeCombo, QListWidget *&sceneList) {
+	/* Header: what is being edited, in words, with the mark's own controls
+	 * beside it. Test performs a real switch, so it is set apart from
+	 * Delete, which lives in the menu with an undo. */
+	auto *header = new QHBoxLayout;
+	auto *titles = new QVBoxLayout;
+	titles->setSpacing(2);
+	m_markTitle = new QLabel;
+	m_markTitle->setObjectName("ttTitle");
+	m_markTitle->setWordWrap(true);
+	titles->addWidget(m_markTitle);
+	m_markSentence = DimLabel();
+	titles->addWidget(m_markSentence);
+	header->addLayout(titles, 1);
+
+	m_markEnabled = new QCheckBox(Tr("Mark.On"));
+	m_markEnabled->setToolTip(Tr("Mark.On.Tooltip"));
+	connect(m_markEnabled, &QCheckBox::toggled, this, [this](bool checked) {
+		if (m_updating)
+			return;
+		Mark *mark = SelectedMark();
+		if (!mark)
+			return;
+		mark->enabled = checked;
+		RefreshMarkSummary(*mark);
+		CommitChange(true);
+	});
+	header->addWidget(m_markEnabled, 0, Qt::AlignTop);
+
+	m_testMarkButton = new QPushButton(Tr("Mark.Test"));
+	m_testMarkButton->setObjectName("ttTest");
+	m_testMarkButton->setToolTip(Tr("Mark.Test.Tooltip"));
+	m_testMarkButton->setAutoDefault(false);
+	connect(m_testMarkButton, &QPushButton::clicked, this, &TransitionTreeDialog::TestMark);
+	header->addWidget(m_testMarkButton, 0, Qt::AlignTop);
+
+	auto *markMenu = new QMenu(this);
+	markMenu->addAction(m_duplicateMarkAction);
+	markMenu->addAction(m_moveUpAction);
+	markMenu->addAction(m_moveDownAction);
+	markMenu->addSeparator();
+	markMenu->addAction(m_deleteMarkAction);
+	m_markMenuButton = new QToolButton;
+	m_markMenuButton->setText(Tr("Menu.Glyph"));
+	m_markMenuButton->setToolTip(Tr("Mark.Menu"));
+	m_markMenuButton->setPopupMode(QToolButton::InstantPopup);
+	m_markMenuButton->setMenu(markMenu);
+	header->addWidget(m_markMenuButton, 0, Qt::AlignTop);
+	layout->addLayout(header);
+
+	m_markWarning = new QLabel;
+	m_markWarning->setObjectName("ttWarning");
+	m_markWarning->setWordWrap(true);
+	m_markWarning->setVisible(false);
+	layout->addWidget(m_markWarning);
+
+	/* Canvas decides which scenes the lists below offer, so it comes first,
+	 * and only appears when there is more than one canvas to choose from. */
+	m_canvasRow = new QWidget;
+	auto *canvasLayout = new QHBoxLayout;
+	canvasLayout->setContentsMargins(0, 0, 0, 0);
+	canvasLayout->addWidget(new QLabel(Tr("Column.Canvas")));
+	m_canvasCombo = new QComboBox;
+	canvasLayout->addWidget(m_canvasCombo, 1);
+	m_canvasRow->setLayout(canvasLayout);
+	layout->addWidget(m_canvasRow);
+	connect(m_canvasCombo, &QComboBox::currentTextChanged, this, [this](const QString &text) {
+		if (m_updating)
+			return;
+		Mark *mark = SelectedMark();
+		if (!mark)
+			return;
+		mark->canvas = text.toStdString();
+		CommitChange(true);
+		/* The scene lists follow the canvas; rebuild them once the combo
+		 * has finished emitting. */
+		QMetaObject::invokeMethod(
+			this,
+			[this]() {
+				if (Mark *current = SelectedMark())
+					RefreshMarkPage(*current);
+			},
+			Qt::QueuedConnection);
+	});
+
+	auto buildMatcherGroup = [this](const char *titleKey, QButtonGroup *&typeGroup, QListWidget *&sceneList,
+					QLabel *&anyNote, QLabel *&count) {
 		auto *group = new QGroupBox(Tr(titleKey));
 		auto *groupLayout = new QVBoxLayout;
 
-		typeCombo = new QComboBox;
-		typeCombo->addItem(Tr("Match.Scenes"));
-		typeCombo->addItem(Tr("Match.Any"));
-		typeCombo->addItem(Tr("Match.AnyExcept"));
-		groupLayout->addWidget(typeCombo);
+		/* A segmented control: all three choices visible at once. */
+		auto *segments = new QHBoxLayout;
+		segments->setSpacing(0);
+		typeGroup = new QButtonGroup(group);
+		typeGroup->setExclusive(true);
+		const std::pair<MatchType, const char *> types[] = {
+			{MatchType::Scenes, "Match.Button.Scenes"},
+			{MatchType::Any, "Match.Button.Any"},
+			{MatchType::AnyExcept, "Match.Button.AnyExcept"},
+		};
+		for (const auto &[type, key] : types) {
+			auto *button = new QToolButton;
+			button->setText(Tr(key));
+			button->setCheckable(true);
+			button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+			typeGroup->addButton(button, (int)type);
+			segments->addWidget(button);
+		}
+		groupLayout->addLayout(segments);
 
 		sceneList = new QListWidget;
 		sceneList->setSelectionMode(QAbstractItemView::NoSelection);
-		sceneList->setMaximumHeight(130);
+		sceneList->setMinimumHeight(110);
+		sceneList->setMaximumHeight(180);
 		groupLayout->addWidget(sceneList);
 
+		anyNote = DimLabel(Tr("Match.AnyNote"));
+		groupLayout->addWidget(anyNote);
+
+		count = DimLabel();
+		groupLayout->addWidget(count);
+
+		groupLayout->addStretch(1);
 		group->setLayout(groupLayout);
 		return group;
 	};
 
-	layout->addWidget(buildMatcherGroup("Mark.From", m_fromType, m_fromScenes));
-	layout->addWidget(buildMatcherGroup("Mark.To", m_toType, m_toScenes));
+	/* From and To side by side, so the editor reads in the same direction
+	 * as the rule. */
+	auto *sides = new QHBoxLayout;
+	sides->addWidget(buildMatcherGroup("Mark.From", m_fromType, m_fromScenes, m_fromAnyNote, m_fromCount), 1);
+	sides->addWidget(buildMatcherGroup("Mark.To", m_toType, m_toScenes, m_toAnyNote, m_toCount), 1);
+	layout->addLayout(sides);
 
 	auto matcherChanged = [this]() {
 		if (m_updating)
@@ -470,32 +994,26 @@ QWidget *TransitionTreeDialog::BuildMarkPage()
 			return;
 		ReadMatcherFromWidgets(mark->from, m_fromType, m_fromScenes);
 		ReadMatcherFromWidgets(mark->to, m_toType, m_toScenes);
-		m_fromScenes->setEnabled(m_fromType->currentIndex() != (int)MatchType::Any);
-		m_toScenes->setEnabled(m_toType->currentIndex() != (int)MatchType::Any);
 		/* Refreshed in place rather than by rebuilding the page, so the
 		 * list the user is clicking through is not destroyed under them. */
-		RefreshMarkWarning(*mark);
+		RefreshMatcherState(mark->from, m_fromScenes, m_fromAnyNote, m_fromCount);
+		RefreshMatcherState(mark->to, m_toScenes, m_toAnyNote, m_toCount);
+		RefreshMarkSummary(*mark);
 		CommitChange(true);
 	};
-	connect(m_fromType, QOverload<int>::of(&QComboBox::currentIndexChanged), this, matcherChanged);
-	connect(m_toType, QOverload<int>::of(&QComboBox::currentIndexChanged), this, matcherChanged);
+	connect(m_fromType, &QButtonGroup::idClicked, this, matcherChanged);
+	connect(m_toType, &QButtonGroup::idClicked, this, matcherChanged);
 	connect(m_fromScenes, &QListWidget::itemChanged, this, matcherChanged);
 	connect(m_toScenes, &QListWidget::itemChanged, this, matcherChanged);
 
-	auto *form = new QFormLayout;
+	auto *candidateGroup = new QGroupBox(Tr("Candidates"));
+	auto *candidateLayout = new QVBoxLayout;
 
-	m_canvasCombo = new QComboBox;
-	connect(m_canvasCombo, &QComboBox::currentTextChanged, this, [this](const QString &text) {
-		if (m_updating)
-			return;
-		Mark *mark = SelectedMark();
-		if (!mark)
-			return;
-		mark->canvas = text.toStdString();
-		CommitChange(true);
-	});
-	form->addRow(Tr("Column.Canvas"), m_canvasCombo);
-
+	/* How to choose only matters once there is something to choose from. */
+	m_modeRow = new QWidget;
+	auto *modeLayout = new QHBoxLayout;
+	modeLayout->setContentsMargins(0, 0, 0, 0);
+	modeLayout->addWidget(new QLabel(Tr("Mode.Label")));
 	m_modeCombo = new QComboBox;
 	m_modeCombo->addItem(ModeName(SelectionMode::Sequential));
 	m_modeCombo->addItem(ModeName(SelectionMode::Random));
@@ -510,60 +1028,35 @@ QWidget *TransitionTreeDialog::BuildMarkPage()
 			return;
 		mark->mode = (SelectionMode)index;
 		mark->ResetRuntimeState();
-		m_candidates->setColumnHidden(2, mark->mode != SelectionMode::Weighted);
+		RefreshMarkSummary(*mark);
 		CommitChange(true);
 	});
-	form->addRow(Tr("Column.Mode"), m_modeCombo);
+	modeLayout->addWidget(m_modeCombo, 1);
+	m_modeRow->setLayout(modeLayout);
+	candidateLayout->addWidget(m_modeRow);
 
-	m_markEnabled = new QCheckBox(Tr("Mark.Enabled"));
-	connect(m_markEnabled, &QCheckBox::toggled, this, [this](bool checked) {
-		if (m_updating)
-			return;
-		Mark *mark = SelectedMark();
-		if (!mark)
-			return;
-		mark->enabled = checked;
-		CommitChange(true);
-	});
-	form->addRow(m_markEnabled);
-
-	layout->addLayout(form);
-
-	m_markWarning = new QLabel;
-	m_markWarning->setWordWrap(true);
-	m_markWarning->setStyleSheet(QString("color: %1;").arg(InvalidColor().name()));
-	layout->addWidget(m_markWarning);
-
-	auto *candidateGroup = new QGroupBox(Tr("Candidates"));
-	auto *candidateLayout = new QVBoxLayout;
-
-	m_candidates = new QTableWidget(0, 4);
-	m_candidates->setHorizontalHeaderLabels(
-		{Tr("Column.Transition"), Tr("Column.Duration"), Tr("Column.Weight"), Tr("Column.Enabled")});
-	m_candidates->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+	m_candidates = new QTableWidget(0, kCandColumnCount);
+	m_candidates->setHorizontalHeaderLabels({Tr("Column.Transition"), Tr("Column.Duration"), Tr("Column.Weight"),
+						 Tr("Column.Share"), Tr("Column.Enabled"), QString()});
+	m_candidates->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+	m_candidates->horizontalHeader()->setSectionResizeMode(kCandTransition, QHeaderView::Stretch);
 	m_candidates->verticalHeader()->setVisible(false);
-	m_candidates->setSelectionBehavior(QAbstractItemView::SelectRows);
-	m_candidates->setSelectionMode(QAbstractItemView::SingleSelection);
-	candidateLayout->addWidget(m_candidates);
+	m_candidates->setSelectionMode(QAbstractItemView::NoSelection);
+	m_candidates->setMinimumHeight(110);
+	candidateLayout->addWidget(m_candidates, 1);
 
 	auto *candidateButtons = new QHBoxLayout;
 	auto *addCandidate = new QPushButton(Tr("Candidate.Add"));
+	addCandidate->setAutoDefault(false);
 	connect(addCandidate, &QPushButton::clicked, this, &TransitionTreeDialog::AddCandidate);
 	candidateButtons->addWidget(addCandidate);
-
-	m_removeCandidateButton = new QPushButton(Tr("Candidate.Remove"));
-	connect(m_removeCandidateButton, &QPushButton::clicked, this, &TransitionTreeDialog::RemoveCandidate);
-	candidateButtons->addWidget(m_removeCandidateButton);
-
-	m_moveUpButton = new QPushButton(Tr("Candidate.MoveUp"));
-	connect(m_moveUpButton, &QPushButton::clicked, this, [this]() { MoveCandidate(-1); });
-	candidateButtons->addWidget(m_moveUpButton);
-
-	m_moveDownButton = new QPushButton(Tr("Candidate.MoveDown"));
-	connect(m_moveDownButton, &QPushButton::clicked, this, [this]() { MoveCandidate(1); });
-	candidateButtons->addWidget(m_moveDownButton);
-
 	candidateButtons->addStretch(1);
+
+	auto *newTransition = new QPushButton(Tr("NewTransition"));
+	newTransition->setToolTip(Tr("NewTransition.Tooltip"));
+	newTransition->setAutoDefault(false);
+	connect(newTransition, &QPushButton::clicked, this, &TransitionTreeDialog::CreateTransition);
+	candidateButtons->addWidget(newTransition);
 	candidateLayout->addLayout(candidateButtons);
 
 	candidateGroup->setLayout(candidateLayout);
@@ -582,23 +1075,16 @@ QWidget *TransitionTreeDialog::BuildBottomBar()
 	auto *credit = new QLabel(QString("<a href=\"https://voidscape.dev\">Transition Tree</a> (%1) "
 					  "by Voidscape Development")
 					  .arg(QString::fromUtf8(PLUGIN_VERSION)));
+	credit->setObjectName("ttDim");
 	credit->setOpenExternalLinks(true);
 	layout->addWidget(credit, 1, Qt::AlignLeft);
 
-	auto *newTransition = new QPushButton(Tr("NewTransition"));
-	newTransition->setToolTip(Tr("NewTransition.Tooltip"));
-	connect(newTransition, &QPushButton::clicked, this, &TransitionTreeDialog::CreateTransition);
-	layout->addWidget(newTransition);
-
-	auto *importButton = new QPushButton(Tr("Import"));
-	connect(importButton, &QPushButton::clicked, this, &TransitionTreeDialog::ImportPresets);
-	layout->addWidget(importButton);
-
-	auto *exportButton = new QPushButton(Tr("Export"));
-	connect(exportButton, &QPushButton::clicked, this, &TransitionTreeDialog::ExportPresets);
-	layout->addWidget(exportButton);
+	auto *shortcuts = new QLabel(Tr("Shortcuts.Hint"));
+	shortcuts->setObjectName("ttDim");
+	layout->addWidget(shortcuts);
 
 	auto *closeButton = new QPushButton(Tr("Close"));
+	closeButton->setAutoDefault(false);
 	connect(closeButton, &QPushButton::clicked, this, &QDialog::close);
 	layout->addWidget(closeButton);
 
@@ -650,12 +1136,29 @@ void TransitionTreeDialog::CommitChange(bool structural)
 void TransitionTreeDialog::RefreshAll()
 {
 	RefreshPresetCombo();
+
+	/* An undo can only restore into the preset it came from, and only while
+	 * that preset is the one on screen. */
+	Preset *preset = CurrentPreset();
+	if (m_undoMark && (!preset || preset->name != m_undoPreset))
+		ClearUndo();
+
+	RefreshCheckerScenes();
 	RefreshTree();
 	RefreshDetail();
+	RefreshMasterState();
+}
+
+void TransitionTreeDialog::RefreshMasterState()
+{
+	const bool enabled = IsTreeEnabled();
 
 	m_updating = true;
-	m_enabledCheck->setChecked(IsTreeEnabled());
+	m_enabledButton->setChecked(enabled);
 	m_updating = false;
+
+	m_enabledButton->setText(enabled ? Tr("TreeEnabled.On") : Tr("TreeEnabled.Off"));
+	m_offBanner->setVisible(!enabled);
 }
 
 void TransitionTreeDialog::RefreshPresetCombo()
@@ -667,60 +1170,97 @@ void TransitionTreeDialog::RefreshPresetCombo()
 
 	Store &store = GetStore();
 	for (const auto &preset : store.presets) {
-		const QString name = QString::fromUtf8(preset.name.c_str());
+		const QString name = Utf8(preset.name);
 		const QString label = preset.global ? Tr("Preset.GlobalLabel").arg(name) : name;
 		m_presetCombo->addItem(label, name);
 	}
 
-	/* Follow the active preset unless the user was looking at another one
-	 * that still exists. */
-	QString target = QString::fromUtf8(store.activePreset.c_str());
-	if (!previous.isEmpty() && store.Find(previous.toStdString()))
+	/* Choosing a preset here activates it, so the combo always shows the
+	 * active preset, including after a hotkey or obs-websocket switch. Only
+	 * fall back to what was shown when nothing is active. */
+	QString target = Utf8(store.activePreset);
+	if (!store.Find(store.activePreset) && !previous.isEmpty() && store.Find(previous.toStdString()))
 		target = previous;
 
 	const int index = m_presetCombo->findData(target);
 	m_presetCombo->setCurrentIndex(index >= 0 ? index : (m_presetCombo->count() > 0 ? 0 : -1));
 
-	Preset *preset = CurrentPreset();
-	m_scopeCombo->setEnabled(preset != nullptr);
-	m_scopeCombo->setCurrentIndex(preset && preset->global ? 1 : 0);
-
 	m_updating = false;
+
+	RefreshPresetActions();
+}
+
+void TransitionTreeDialog::RefreshPresetActions()
+{
+	Preset *preset = CurrentPreset();
+	const bool hasPreset = preset != nullptr;
+
+	m_duplicatePresetAction->setEnabled(hasPreset);
+	m_renamePresetAction->setEnabled(hasPreset);
+	m_deletePresetAction->setEnabled(hasPreset);
+	m_exportAction->setEnabled(hasPreset);
+	m_scopeLocalAction->setEnabled(hasPreset);
+	m_scopeGlobalAction->setEnabled(hasPreset);
+	m_scopeLocalAction->setChecked(hasPreset && !preset->global);
+	m_scopeGlobalAction->setChecked(hasPreset && preset->global);
+	if (m_presetExportButton)
+		m_presetExportButton->setEnabled(hasPreset);
 }
 
 void TransitionTreeDialog::RefreshTree()
 {
 	m_updating = true;
 
-	/* Remember which groups were open so editing does not collapse the view. */
-	QStringList expanded;
+	/* Remember which groups the user closed, so editing does not reopen
+	 * them, while groups that are new (a new rule) start open. Groups not
+	 * currently shown keep whatever state they last had. */
 	for (int i = 0; i < m_tree->topLevelItemCount(); i++) {
 		QTreeWidgetItem *item = m_tree->topLevelItem(i);
-		if (item->isExpanded())
-			expanded << item->text(0);
+		const QString key = item->data(kColScenes, kGroupKeyRole).toString();
+		m_collapsedGroups.removeAll(key);
+		if (!item->isExpanded())
+			m_collapsedGroups << key;
 	}
 
 	m_tree->clear();
 
+	/* Almost everyone has a single canvas; a column that says "Main" on
+	 * every row is noise. */
+	m_tree->setColumnHidden(kColCanvas, CanvasNames().size() < 2);
+
 	Preset *preset = CurrentPreset();
+	const QString filter = m_search->text().trimmed();
+	size_t total = 0;
+	size_t enabledCount = 0;
+	size_t problemCount = 0;
+
 	if (preset) {
-		const QString filter = m_search->text().trimmed();
-		const QString mainCanvas = QString::fromUtf8(MainCanvasName().c_str());
+		const QString mainCanvas = Utf8(MainCanvasName());
+		const QIcon warningIcon = style()->standardIcon(QStyle::SP_MessageBoxWarning);
 
 		QHash<QString, QTreeWidgetItem *> groups;
+		QHash<QString, int> groupCounts;
 
-		for (auto &mark : preset->marks) {
-			const QString fromText = QString::fromUtf8(mark.from.Describe().c_str());
-			const QString toText = QString::fromUtf8(mark.to.Describe().c_str());
-			const QString canvas = mark.canvas.empty() ? mainCanvas
-								   : QString::fromUtf8(mark.canvas.c_str());
+		for (size_t position = 0; position < preset->marks.size(); position++) {
+			const Mark &mark = preset->marks[position];
+			const QStringList problems = MarkProblems(mark);
+			total++;
+			if (mark.enabled)
+				enabledCount++;
+			if (!problems.isEmpty())
+				problemCount++;
+
+			const QString fromText = Utf8(mark.from.Describe());
+			const QString toText = Utf8(mark.to.Describe());
+			const QString canvas = mark.canvas.empty() ? mainCanvas : Utf8(mark.canvas);
 			const QString summary = MarkSummary(mark);
+			const auto usable = mark.UsableCandidates();
 
 			if (!filter.isEmpty()) {
 				QString haystack = fromText + " " + toText + " " + summary + " " + canvas + " " +
 						   ModeName(mark.mode);
 				for (const auto &candidate : mark.candidates)
-					haystack += " " + QString::fromUtf8(candidate.transition.c_str());
+					haystack += " " + Utf8(candidate.transition);
 				if (!haystack.contains(filter, Qt::CaseInsensitive))
 					continue;
 			}
@@ -729,72 +1269,91 @@ void TransitionTreeDialog::RefreshTree()
 			QTreeWidgetItem *group = groups.value(groupKey, nullptr);
 			if (!group) {
 				group = new QTreeWidgetItem(m_tree);
-				group->setText(0, fromText);
-				group->setFirstColumnSpanned(false);
-				QFont font = group->font(0);
+				group->setData(kColScenes, kGroupKeyRole, groupKey);
+				QFont font = group->font(kColScenes);
 				font.setBold(true);
-				group->setFont(0, font);
+				group->setFont(kColScenes, font);
 				if (!mark.from.MissingScenes().empty())
-					group->setForeground(0, InvalidColor());
+					group->setForeground(kColScenes, InvalidColor());
 				groups.insert(groupKey, group);
 			}
+			groupCounts[groupKey]++;
 
 			auto *item = new QTreeWidgetItem(group);
-			item->setText(0, Tr("Mark.ToPrefix").arg(toText));
-			item->setText(1, summary);
-			item->setText(2, ModeName(mark.mode));
-			item->setText(3, canvas);
-			item->setData(0, kMarkIdRole, QString::fromUtf8(mark.id.c_str()));
+			item->setText(kColScenes, Tr("Mark.ToPrefix").arg(toText));
+			item->setText(kColTransition, summary);
+			item->setToolTip(kColTransition, CandidateList(mark));
+			/* The mode only means something with more than one choice. */
+			item->setText(kColMode, usable.size() > 1 ? ModeName(mark.mode) : QString());
+			item->setText(kColOrder, QString::number(position + 1));
+			item->setTextAlignment(kColOrder, Qt::AlignRight | Qt::AlignVCenter);
+			item->setText(kColCanvas, canvas);
+			item->setData(kColScenes, kMarkIdRole, Utf8(mark.id));
 			item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-			item->setCheckState(4, mark.enabled ? Qt::Checked : Qt::Unchecked);
+			item->setCheckState(kColScenes, mark.enabled ? Qt::Checked : Qt::Unchecked);
 
-			auto missing = mark.from.MissingScenes();
-			for (const auto &scene : mark.to.MissingScenes())
-				missing.push_back(scene);
-			if (!missing.empty()) {
-				QStringList names;
-				for (const auto &scene : missing)
-					names << QString::fromUtf8(scene.c_str());
-				item->setForeground(0, InvalidColor());
-				item->setToolTip(0, Tr("Mark.MissingScenes").arg(names.join(", ")));
+			if (!problems.isEmpty()) {
+				item->setIcon(kColScenes, warningIcon);
+				item->setToolTip(kColScenes, problems.join("\n"));
 			}
+			if (!MissingScenes(mark).empty())
+				item->setForeground(kColScenes, InvalidColor());
+
 			if (!mark.enabled) {
-				QFont font = item->font(0);
-				font.setItalic(true);
-				item->setFont(0, font);
-			}
-
-			for (size_t i = 0; i < mark.candidates.size(); i++) {
-				const Candidate &candidate = mark.candidates[i];
-				auto *child = new QTreeWidgetItem(item);
-				child->setText(0, QString::fromUtf8(candidate.transition.c_str()));
-				child->setText(1, QString("%1 ms").arg(candidate.duration));
-				if (mark.mode == SelectionMode::Weighted)
-					child->setText(2, Tr("Weight.Label").arg(candidate.weight, 0, 'g', 3));
-				child->setData(0, kMarkIdRole, QString::fromUtf8(mark.id.c_str()));
-				if (!candidate.enabled) {
-					QFont font = child->font(0);
-					font.setStrikeOut(true);
-					child->setFont(0, font);
+				for (int column = 0; column < kTreeColumnCount; column++) {
+					if (column != kColScenes || MissingScenes(mark).empty())
+						item->setForeground(column, DimColor());
 				}
+				QFont font = item->font(kColScenes);
+				font.setItalic(true);
+				item->setFont(kColScenes, font);
 			}
 		}
 
 		for (int i = 0; i < m_tree->topLevelItemCount(); i++) {
 			QTreeWidgetItem *item = m_tree->topLevelItem(i);
+			const QString key = item->data(kColScenes, kGroupKeyRole).toString();
+			item->setText(kColScenes, Tr("Tree.Group").arg(key, QString::number(groupCounts.value(key))));
 			/* Expand by default; a filtered view is most useful open. */
-			item->setExpanded(expanded.isEmpty() || expanded.contains(item->text(0)) || !filter.isEmpty());
+			item->setExpanded(!m_collapsedGroups.contains(key) || !filter.isEmpty());
 		}
 	}
 
+	/* Show a placeholder that says what to do instead of an empty list. */
+	if (!preset) {
+		m_emptyState = EmptyState::NoPreset;
+		m_emptyLabel->setText(Tr("Preset.None"));
+		m_emptyButton->setText(Tr("Preset.New"));
+	} else if (preset->marks.empty()) {
+		m_emptyState = EmptyState::NoMarks;
+		m_emptyLabel->setText(Tr("Empty.NoMarks"));
+		m_emptyButton->setText(Tr("Empty.AddFirst"));
+	} else if (m_tree->topLevelItemCount() == 0) {
+		m_emptyState = EmptyState::NoMatches;
+		m_emptyLabel->setText(Tr("Empty.NoMatches").arg(filter));
+		m_emptyButton->setText(Tr("Empty.ClearFilter"));
+	} else {
+		m_emptyState = EmptyState::None;
+	}
+	m_treeStack->setCurrentIndex(m_emptyState == EmptyState::None ? 0 : 1);
+
+	QString footer;
+	if (total > 0) {
+		footer = Tr("Tree.Footer").arg(total).arg(enabledCount);
+		if (problemCount > 0)
+			footer = Tr("Tree.FooterProblems").arg(footer).arg(problemCount);
+	}
+	m_treeFooter->setText(footer);
+	m_treeFooter->setVisible(!footer.isEmpty());
+
 	/* Restore the previous selection where the mark still exists. */
 	if (!m_selectedMarkId.empty()) {
-		const QString wanted = QString::fromUtf8(m_selectedMarkId.c_str());
+		const QString wanted = Utf8(m_selectedMarkId);
 		QTreeWidgetItemIterator iterator(m_tree);
 		while (*iterator) {
-			if ((*iterator)->data(0, kMarkIdRole).toString() == wanted &&
-			    (*iterator)->parent() != nullptr && (*iterator)->parent()->parent() == nullptr) {
+			if ((*iterator)->data(kColScenes, kMarkIdRole).toString() == wanted) {
 				(*iterator)->setSelected(true);
+				m_tree->setCurrentItem(*iterator);
 				break;
 			}
 			++iterator;
@@ -803,11 +1362,165 @@ void TransitionTreeDialog::RefreshTree()
 
 	m_updating = false;
 
-	const bool hasMark = SelectedMark() != nullptr;
-	m_duplicateMarkButton->setEnabled(hasMark);
-	m_deleteMarkButton->setEnabled(hasMark);
-	m_toggleMarkButton->setEnabled(hasMark);
-	m_testMarkButton->setEnabled(hasMark);
+	RefreshChecker();
+	RefreshMarkActions();
+}
+
+void TransitionTreeDialog::RefreshCheckerScenes()
+{
+	if (!m_checkerButton || !m_checkerButton->isChecked())
+		return;
+
+	const QSignalBlocker blockCanvas(m_checkCanvas);
+	const QSignalBlocker blockFrom(m_checkFrom);
+	const QSignalBlocker blockTo(m_checkTo);
+
+	const QStringList canvases = CanvasNames();
+	const QString previousCanvas = m_checkCanvas->currentText();
+	m_checkCanvas->clear();
+	m_checkCanvas->addItems(canvases);
+	const int canvasIndex =
+		m_checkCanvas->findText(previousCanvas.isEmpty() ? Utf8(MainCanvasName()) : previousCanvas);
+	if (canvasIndex >= 0)
+		m_checkCanvas->setCurrentIndex(canvasIndex);
+	m_checkCanvas->setVisible(canvases.size() > 1);
+
+	const QString canvas = m_checkCanvas->count() > 0 ? m_checkCanvas->currentText() : Utf8(MainCanvasName());
+	QStringList scenes = SceneNamesForCanvas(canvas);
+	SortNames(scenes);
+
+	/* Start from the live scene, going to the first other scene: the
+	 * question someone usually has is "what happens next?". */
+	QString from = m_checkFrom->currentText();
+	if (from.isEmpty() || !scenes.contains(from)) {
+		from.clear();
+		if (obs_source_t *current = obs_frontend_get_current_scene()) {
+			from = QString::fromUtf8(obs_source_get_name(current));
+			obs_source_release(current);
+		}
+		if (!scenes.contains(from))
+			from = scenes.isEmpty() ? QString() : scenes.first();
+	}
+	QString to = m_checkTo->currentText();
+	if (to.isEmpty() || !scenes.contains(to)) {
+		to.clear();
+		for (const QString &scene : scenes) {
+			if (scene != from) {
+				to = scene;
+				break;
+			}
+		}
+	}
+
+	m_checkFrom->clear();
+	m_checkFrom->addItems(scenes);
+	m_checkFrom->setCurrentText(from);
+	m_checkTo->clear();
+	m_checkTo->addItems(scenes);
+	m_checkTo->setCurrentText(to);
+}
+
+void TransitionTreeDialog::RefreshChecker()
+{
+	if (!m_checkerButton || !m_checkerButton->isChecked())
+		return;
+
+	Preset *preset = CurrentPreset();
+	const std::string from = m_checkFrom->currentText().toStdString();
+	const std::string to = m_checkTo->currentText().toStdString();
+	if (!preset || from.empty() || to.empty()) {
+		m_checkResult->setText(Tr("Checker.Nothing").toHtmlEscaped());
+		return;
+	}
+
+	const std::string canvas = m_checkCanvas->count() > 0 ? m_checkCanvas->currentText().toStdString()
+							      : MainCanvasName();
+	const auto matches = ExplainSwitch(*preset, canvas, from, to);
+
+	QString headline;
+	QStringList lines;
+	bool hasWinner = false;
+	QHash<QString, MatchOutcome> outcomes;
+	for (const auto &match : matches) {
+		const Mark &mark = preset->marks[match.index];
+		const QString id = Utf8(mark.id).toHtmlEscaped();
+		const QString link = QString("<a href=\"rule:%1\">%2</a>").arg(id, MarkTitle(mark).toHtmlEscaped());
+		outcomes.insert(Utf8(mark.id), match.outcome);
+
+		switch (match.outcome) {
+		case MatchOutcome::Wins:
+			hasWinner = true;
+			headline = Tr("Checker.Wins").arg(link, MarkSummary(mark).toHtmlEscaped());
+			break;
+		case MatchOutcome::LessSpecific:
+			lines << Tr("Checker.LessSpecific").arg(link);
+			break;
+		case MatchOutcome::TiedListedLater:
+			lines << Tr("Checker.Tied")
+					 .arg(link, QString::number(match.index + 1),
+					      QString("<a href=\"prefer:%1\">%2</a>")
+						      .arg(id, Tr("Checker.MakeWin").toHtmlEscaped()));
+			break;
+		case MatchOutcome::Off:
+			lines << Tr("Checker.Off").arg(link);
+			break;
+		case MatchOutcome::NoTransition:
+			lines << Tr("Checker.NoTransition").arg(link);
+			break;
+		}
+	}
+
+	if (!hasWinner) {
+		if (preset->setDefaultTransition && !preset->defaultTransition.empty())
+			headline = Tr("Checker.NoWinnerFallback")
+					   .arg(Utf8(preset->defaultTransition).toHtmlEscaped(),
+						QString::number(preset->defaultDuration));
+		else
+			headline = Tr("Checker.NoWinner").toHtmlEscaped();
+	}
+	lines.prepend(headline);
+	if (!IsTreeEnabled())
+		lines.prepend(Tr("Checker.TreeOff").toHtmlEscaped());
+
+	m_checkResult->setText(lines.join("<br>"));
+
+	/* Mirror the answer in the tree: the winner in green, the rules that
+	 * match but lose in amber. */
+	const QBrush winBrush(QColor(47, 138, 98, 90));
+	const QBrush loseBrush(QColor(229, 169, 59, 55));
+	m_updating = true;
+	QTreeWidgetItemIterator iterator(m_tree);
+	while (*iterator) {
+		QTreeWidgetItem *item = *iterator;
+		const QString id = item->data(kColScenes, kMarkIdRole).toString();
+		QBrush brush;
+		if (!id.isEmpty() && outcomes.contains(id))
+			brush = outcomes.value(id) == MatchOutcome::Wins ? winBrush : loseBrush;
+		for (int column = 0; column < kTreeColumnCount; column++)
+			item->setBackground(column, brush);
+		++iterator;
+	}
+	m_updating = false;
+}
+
+void TransitionTreeDialog::RefreshMarkActions()
+{
+	Mark *mark = SelectedMark();
+	const bool hasMark = mark != nullptr;
+
+	m_duplicateMarkAction->setEnabled(hasMark);
+	m_deleteMarkAction->setEnabled(hasMark);
+	m_toggleMarkAction->setEnabled(hasMark);
+	m_testMarkAction->setEnabled(hasMark);
+	m_toggleMarkAction->setText(hasMark && !mark->enabled ? Tr("Mark.TurnOn") : Tr("Mark.TurnOff"));
+	m_addMarkAction->setEnabled(CurrentPreset() != nullptr);
+
+	Preset *preset = CurrentPreset();
+	size_t index = 0;
+	if (hasMark && preset)
+		index = (size_t)(mark - preset->marks.data());
+	m_moveUpAction->setEnabled(hasMark && index > 0);
+	m_moveDownAction->setEnabled(hasMark && preset && index + 1 < preset->marks.size());
 }
 
 void TransitionTreeDialog::RefreshDetail()
@@ -820,13 +1533,15 @@ void TransitionTreeDialog::RefreshDetail()
 		RefreshPresetPage();
 		m_detail->setCurrentIndex(0);
 	}
+	RefreshMarkActions();
 }
 
-void TransitionTreeDialog::RefreshMatcherWidgets(const SceneMatcher &matcher, QComboBox *typeCombo,
-						 QListWidget *sceneList, const QString &canvas)
+void TransitionTreeDialog::RefreshMatcherWidgets(const SceneMatcher &matcher, QButtonGroup *typeGroup,
+						 QListWidget *sceneList, QLabel *anyNote, QLabel *count,
+						 const QString &canvas)
 {
-	typeCombo->setCurrentIndex((int)matcher.type);
-	sceneList->setEnabled(matcher.type != MatchType::Any);
+	if (QAbstractButton *button = typeGroup->button((int)matcher.type))
+		button->setChecked(true);
 
 	sceneList->clear();
 
@@ -835,7 +1550,7 @@ void TransitionTreeDialog::RefreshMatcherWidgets(const SceneMatcher &matcher, QC
 	/* Keep scene names the matcher references even when they are missing from
 	 * this collection, so switching collections never silently drops them. */
 	for (const auto &name : matcher.scenes) {
-		const QString scene = QString::fromUtf8(name.c_str());
+		const QString scene = Utf8(name);
 		if (!scenes.contains(scene))
 			scenes << scene;
 	}
@@ -843,6 +1558,7 @@ void TransitionTreeDialog::RefreshMatcherWidgets(const SceneMatcher &matcher, QC
 	SortNames(scenes);
 
 	const auto missing = matcher.MissingScenes();
+	const QIcon warningIcon = style()->standardIcon(QStyle::SP_MessageBoxWarning);
 	for (const QString &scene : scenes) {
 		auto *item = new QListWidgetItem(scene, sceneList);
 		item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
@@ -853,67 +1569,93 @@ void TransitionTreeDialog::RefreshMatcherWidgets(const SceneMatcher &matcher, QC
 
 		if (std::find(missing.begin(), missing.end(), scene.toStdString()) != missing.end()) {
 			item->setForeground(InvalidColor());
+			item->setIcon(warningIcon);
 			item->setToolTip(Tr("Scene.Missing"));
 		}
 	}
+
+	RefreshMatcherState(matcher, sceneList, anyNote, count);
+}
+
+void TransitionTreeDialog::RefreshMatcherState(const SceneMatcher &matcher, QListWidget *sceneList, QLabel *anyNote,
+					       QLabel *count)
+{
+	/* "Any scene" needs no list at all; say what it means instead of
+	 * leaving a disabled list on screen. */
+	const bool any = matcher.type == MatchType::Any;
+	sceneList->setVisible(!any);
+	count->setVisible(!any);
+	anyNote->setVisible(any);
+
+	const int selected = (int)matcher.scenes.size();
+	count->setText(matcher.type == MatchType::AnyExcept ? Tr("Match.ExcludedCount").arg(selected)
+							    : Tr("Match.SelectedCount").arg(selected));
 }
 
 void TransitionTreeDialog::RefreshMarkPage(Mark &mark)
 {
 	m_updating = true;
 
-	const QString canvas = mark.canvas.empty() ? QString::fromUtf8(MainCanvasName().c_str())
-						   : QString::fromUtf8(mark.canvas.c_str());
+	const QString canvas = mark.canvas.empty() ? Utf8(MainCanvasName()) : Utf8(mark.canvas);
+	const QStringList canvases = CanvasNames();
 
 	m_canvasCombo->clear();
-	m_canvasCombo->addItems(CanvasNames());
+	m_canvasCombo->addItems(canvases);
 	const int canvasIndex = m_canvasCombo->findText(canvas);
 	if (canvasIndex >= 0)
 		m_canvasCombo->setCurrentIndex(canvasIndex);
+	m_canvasRow->setVisible(canvases.size() > 1);
 
-	RefreshMatcherWidgets(mark.from, m_fromType, m_fromScenes, canvas);
-	RefreshMatcherWidgets(mark.to, m_toType, m_toScenes, canvas);
+	RefreshMatcherWidgets(mark.from, m_fromType, m_fromScenes, m_fromAnyNote, m_fromCount, canvas);
+	RefreshMatcherWidgets(mark.to, m_toType, m_toScenes, m_toAnyNote, m_toCount, canvas);
 
 	m_modeCombo->setCurrentIndex((int)mark.mode);
 	m_markEnabled->setChecked(mark.enabled);
 
-	RefreshMarkWarning(mark);
-
-	m_candidates->setColumnHidden(2, mark.mode != SelectionMode::Weighted);
-
 	m_updating = false;
 
 	RefreshCandidateTable(mark);
+	RefreshMarkSummary(mark);
+}
+
+void TransitionTreeDialog::RefreshMarkSummary(const Mark &mark)
+{
+	m_markTitle->setText(MarkTitle(mark));
+	m_markSentence->setText(MarkSentence(mark));
+	RefreshMarkWarning(mark);
+
+	m_modeRow->setVisible(mark.candidates.size() > 1);
+	const bool weighted = mark.mode == SelectionMode::Weighted && mark.candidates.size() > 1;
+	m_candidates->setColumnHidden(kCandWeight, !weighted);
+	m_candidates->setColumnHidden(kCandShare, !weighted);
+	RefreshCandidateShares(mark);
+
+	RefreshMarkActions();
 }
 
 void TransitionTreeDialog::RefreshMarkWarning(const Mark &mark)
 {
-	QStringList warnings;
-	if (mark.from.IsEmpty() || mark.to.IsEmpty())
-		warnings << Tr("Warning.NoScenesSelected");
-	if (mark.UsableCandidates().empty())
-		warnings << Tr("Warning.NoUsableCandidates");
-
-	m_markWarning->setText(warnings.join(" "));
-	m_markWarning->setVisible(!warnings.isEmpty());
+	const QStringList problems = MarkProblems(mark);
+	m_markWarning->setText(problems.join("\n"));
+	m_markWarning->setVisible(!problems.isEmpty());
 }
 
 void TransitionTreeDialog::RefreshCandidateTable(Mark &mark)
 {
 	m_updating = true;
 
-	const int previousRow = m_candidates->currentRow();
 	QStringList transitions = TransitionNames();
 	SortNames(transitions);
 
 	m_candidates->setRowCount((int)mark.candidates.size());
+	const int lastRow = (int)mark.candidates.size() - 1;
 
 	for (int row = 0; row < (int)mark.candidates.size(); row++) {
 		const Candidate &candidate = mark.candidates[(size_t)row];
 
 		auto *transitionCombo = new QComboBox;
 		transitionCombo->addItems(transitions);
-		const QString current = QString::fromUtf8(candidate.transition.c_str());
+		const QString current = Utf8(candidate.transition);
 		if (transitionCombo->findText(current) < 0 && !current.isEmpty())
 			transitionCombo->addItem(current);
 		transitionCombo->setCurrentText(current);
@@ -924,9 +1666,10 @@ void TransitionTreeDialog::RefreshCandidateTable(Mark &mark)
 			if (!target || row >= (int)target->candidates.size())
 				return;
 			target->candidates[(size_t)row].transition = text.toStdString();
+			RefreshMarkSummary(*target);
 			CommitChange(true);
 		});
-		m_candidates->setCellWidget(row, 0, transitionCombo);
+		m_candidates->setCellWidget(row, kCandTransition, transitionCombo);
 
 		auto *duration = new QSpinBox;
 		duration->setRange(0, 20000);
@@ -940,9 +1683,10 @@ void TransitionTreeDialog::RefreshCandidateTable(Mark &mark)
 			if (!target || row >= (int)target->candidates.size())
 				return;
 			target->candidates[(size_t)row].duration = value;
+			RefreshMarkSummary(*target);
 			CommitChange(true);
 		});
-		m_candidates->setCellWidget(row, 1, duration);
+		m_candidates->setCellWidget(row, kCandDuration, duration);
 
 		auto *weight = new QDoubleSpinBox;
 		weight->setRange(0.0, 1000.0);
@@ -956,9 +1700,15 @@ void TransitionTreeDialog::RefreshCandidateTable(Mark &mark)
 			if (!target || row >= (int)target->candidates.size())
 				return;
 			target->candidates[(size_t)row].weight = value;
+			RefreshCandidateShares(*target);
 			CommitChange(true);
 		});
-		m_candidates->setCellWidget(row, 2, weight);
+		m_candidates->setCellWidget(row, kCandWeight, weight);
+
+		auto *share = new QTableWidgetItem;
+		share->setFlags(Qt::ItemIsEnabled);
+		share->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+		m_candidates->setItem(row, kCandShare, share);
 
 		auto *enabled = new QCheckBox;
 		enabled->setChecked(candidate.enabled);
@@ -969,15 +1719,71 @@ void TransitionTreeDialog::RefreshCandidateTable(Mark &mark)
 			if (!target || row >= (int)target->candidates.size())
 				return;
 			target->candidates[(size_t)row].enabled = checked;
+			RefreshMarkSummary(*target);
 			CommitChange(true);
 		});
-		m_candidates->setCellWidget(row, 3, enabled);
+		m_candidates->setCellWidget(row, kCandEnabled, enabled);
+
+		/* Per-row actions, so there is never a question of which row a
+		 * toolbar button would act on. They rebuild the table, which
+		 * deletes the button being clicked, so they run after the click. */
+		auto *actions = new QWidget;
+		auto *actionsLayout = new QHBoxLayout;
+		actionsLayout->setContentsMargins(0, 0, 0, 0);
+		actionsLayout->setSpacing(2);
+
+		auto addRowAction = [&](QToolButton *button, const char *tooltipKey, auto handler) {
+			button->setToolTip(Tr(tooltipKey));
+			button->setAutoRaise(true);
+			connect(button, &QToolButton::clicked, this,
+				[this, handler]() { QMetaObject::invokeMethod(this, handler, Qt::QueuedConnection); });
+			actionsLayout->addWidget(button);
+		};
+
+		auto *up = new QToolButton;
+		up->setArrowType(Qt::UpArrow);
+		up->setEnabled(row > 0);
+		addRowAction(up, "Candidate.MoveUp", [this, row]() { MoveCandidate(row, -1); });
+
+		auto *down = new QToolButton;
+		down->setArrowType(Qt::DownArrow);
+		down->setEnabled(row < lastRow);
+		addRowAction(down, "Candidate.MoveDown", [this, row]() { MoveCandidate(row, 1); });
+
+		auto *remove = new QToolButton;
+		remove->setText(Tr("Candidate.RemoveGlyph"));
+		addRowAction(remove, "Candidate.Remove", [this, row]() { RemoveCandidate(row); });
+
+		actions->setLayout(actionsLayout);
+		m_candidates->setCellWidget(row, kCandActions, actions);
 	}
 
-	if (previousRow >= 0 && previousRow < m_candidates->rowCount())
-		m_candidates->setCurrentCell(previousRow, 0);
-
 	m_updating = false;
+
+	RefreshCandidateShares(mark);
+}
+
+void TransitionTreeDialog::RefreshCandidateShares(const Mark &mark)
+{
+	/* A bare weight like 2.00 means nothing on its own; show what share of
+	 * the picks it actually gets among the transitions that can fire. */
+	double total = 0.0;
+	const auto usable = mark.UsableCandidates();
+	for (size_t index : usable)
+		total += std::max(0.0, mark.candidates[index].weight);
+
+	const int rows = std::min(m_candidates->rowCount(), (int)mark.candidates.size());
+	for (int row = 0; row < rows; row++) {
+		QTableWidgetItem *item = m_candidates->item(row, kCandShare);
+		if (!item)
+			continue;
+		const bool isUsable = std::find(usable.begin(), usable.end(), (size_t)row) != usable.end();
+		const double weight = std::max(0.0, mark.candidates[(size_t)row].weight);
+		if (isUsable && total > 0.0)
+			item->setText(QString("%1%").arg(qRound(weight / total * 100.0)));
+		else
+			item->setText(Tr("Candidate.NoShare"));
+	}
 }
 
 void TransitionTreeDialog::RefreshPresetPage()
@@ -986,6 +1792,7 @@ void TransitionTreeDialog::RefreshPresetPage()
 
 	Preset *preset = CurrentPreset();
 	if (!preset) {
+		m_presetTitle->setText(Tr("Preset.NoneTitle"));
 		m_presetSummary->setText(Tr("Preset.None"));
 		m_setDefaultTransition->setEnabled(false);
 		m_defaultTransition->setEnabled(false);
@@ -995,18 +1802,22 @@ void TransitionTreeDialog::RefreshPresetPage()
 	}
 
 	size_t enabledMarks = 0;
+	size_t problemMarks = 0;
 	for (const auto &mark : preset->marks) {
 		if (mark.enabled)
 			enabledMarks++;
+		if (!MarkProblems(mark).isEmpty())
+			problemMarks++;
 	}
 
 	const bool isActive = GetStore().activePreset == preset->name;
+	m_presetTitle->setText(Utf8(preset->name));
 	m_presetSummary->setText(Tr("Preset.Summary")
-					 .arg(QString::fromUtf8(preset->name.c_str()))
-					 .arg(preset->global ? Tr("Scope.Global") : Tr("Scope.Local"))
-					 .arg(preset->marks.size())
-					 .arg(enabledMarks)
-					 .arg(isActive ? Tr("Preset.Active") : Tr("Preset.Inactive")));
+					 .arg(isActive ? Tr("Preset.Active") : Tr("Preset.Inactive"),
+					      preset->global ? Tr("Scope.GlobalLong") : Tr("Scope.LocalLong"),
+					      QString::number(preset->marks.size()), QString::number(enabledMarks),
+					      QString::number(problemMarks)) +
+				 (preset->marks.empty() ? QString() : "\n" + Tr("Preset.SelectHint")));
 
 	m_setDefaultTransition->setEnabled(true);
 	m_setDefaultTransition->setChecked(preset->setDefaultTransition);
@@ -1016,7 +1827,7 @@ void TransitionTreeDialog::RefreshPresetPage()
 
 	m_defaultTransition->clear();
 	m_defaultTransition->addItems(transitions);
-	m_defaultTransition->setCurrentText(QString::fromUtf8(preset->defaultTransition.c_str()));
+	m_defaultTransition->setCurrentText(Utf8(preset->defaultTransition));
 	m_defaultTransition->setEnabled(preset->setDefaultTransition);
 
 	m_defaultDuration->setValue(preset->defaultDuration);
@@ -1034,15 +1845,12 @@ void TransitionTreeDialog::OnPresetChanged(int)
 	if (m_updating)
 		return;
 
-	Preset *preset = CurrentPreset();
-	m_scopeCombo->setEnabled(preset != nullptr);
-
-	m_updating = true;
-	m_scopeCombo->setCurrentIndex(preset && preset->global ? 1 : 0);
-	m_updating = false;
+	RefreshPresetActions();
+	ClearUndo();
 
 	/* Selecting a preset in the editor also activates it: a preset that is
 	 * being edited but not in effect would be a trap during a live show. */
+	Preset *preset = CurrentPreset();
 	if (preset && GetStore().activePreset != preset->name) {
 		SetActivePreset(preset->name);
 		return;
@@ -1061,19 +1869,12 @@ void TransitionTreeDialog::OnTreeSelectionChanged()
 	const auto selected = m_tree->selectedItems();
 	std::string markId;
 	if (!selected.isEmpty())
-		markId = selected.first()->data(0, kMarkIdRole).toString().toStdString();
+		markId = selected.first()->data(kColScenes, kMarkIdRole).toString().toStdString();
 
 	if (markId == m_selectedMarkId)
 		return;
 
 	m_selectedMarkId = markId;
-
-	const bool hasMark = SelectedMark() != nullptr;
-	m_duplicateMarkButton->setEnabled(hasMark);
-	m_deleteMarkButton->setEnabled(hasMark);
-	m_toggleMarkButton->setEnabled(hasMark);
-	m_testMarkButton->setEnabled(hasMark);
-
 	RefreshDetail();
 }
 
@@ -1082,6 +1883,27 @@ void TransitionTreeDialog::OnSearchChanged(const QString &)
 	if (m_updating)
 		return;
 	RefreshTree();
+}
+
+void TransitionTreeDialog::ShowTreeContextMenu(const QPoint &pos)
+{
+	if (QTreeWidgetItem *item = m_tree->itemAt(pos))
+		m_tree->setCurrentItem(item);
+
+	QMenu menu(this);
+	menu.addAction(m_addMarkAction);
+	if (SelectedMark()) {
+		menu.addSeparator();
+		menu.addAction(m_toggleMarkAction);
+		menu.addAction(m_duplicateMarkAction);
+		menu.addAction(m_testMarkAction);
+		menu.addSeparator();
+		menu.addAction(m_moveUpAction);
+		menu.addAction(m_moveDownAction);
+		menu.addSeparator();
+		menu.addAction(m_deleteMarkAction);
+	}
+	menu.exec(m_tree->viewport()->mapToGlobal(pos));
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1096,16 +1918,14 @@ void TransitionTreeDialog::AddPreset()
 	if (!accepted || name.trimmed().isEmpty())
 		return;
 
+	/* New presets start local; the preset menu moves one to global. */
 	Store &store = GetStore();
 	Preset preset;
 	preset.name = store.UniqueName(name.trimmed().toStdString());
-	preset.global = m_scopeCombo->currentIndex() == 1;
+	preset.global = false;
 	store.presets.push_back(preset);
 
 	RefreshPresetHotkeys();
-	if (preset.global)
-		SaveGlobalPresets();
-
 	SetActivePreset(preset.name);
 }
 
@@ -1138,8 +1958,7 @@ void TransitionTreeDialog::RenamePreset()
 
 	bool accepted = false;
 	const QString name = QInputDialog::getText(this, Tr("Preset.Rename"), Tr("Preset.NamePrompt"),
-						   QLineEdit::Normal, QString::fromUtf8(preset->name.c_str()),
-						   &accepted);
+						   QLineEdit::Normal, Utf8(preset->name), &accepted);
 	if (!accepted || name.trimmed().isEmpty())
 		return;
 
@@ -1152,6 +1971,16 @@ void TransitionTreeDialog::RenamePreset()
 	preset->name = store.UniqueName(next);
 	if (store.activePreset == previous)
 		store.activePreset = preset->name;
+	if (m_undoPreset == previous)
+		m_undoPreset = preset->name;
+
+	/* The combo is keyed by name, so point it at the new one before the
+	 * rebuild looks for it. */
+	m_updating = true;
+	const int index = m_presetCombo->currentIndex();
+	if (index >= 0)
+		m_presetCombo->setItemData(index, Utf8(preset->name));
+	m_updating = false;
 
 	RefreshPresetHotkeys();
 	SaveGlobalPresets();
@@ -1165,7 +1994,7 @@ void TransitionTreeDialog::DeletePreset()
 	if (!preset)
 		return;
 
-	const QString name = QString::fromUtf8(preset->name.c_str());
+	const QString name = Utf8(preset->name);
 	if (QMessageBox::question(this, Tr("Preset.Delete"), Tr("Preset.DeleteConfirm").arg(name)) != QMessageBox::Yes)
 		return;
 
@@ -1185,6 +2014,7 @@ void TransitionTreeDialog::DeletePreset()
 		SaveGlobalPresets();
 
 	m_selectedMarkId.clear();
+	ClearUndo();
 
 	if (wasActive)
 		SetActivePreset(store.presets.empty() ? std::string() : store.presets.front().name);
@@ -1192,17 +2022,13 @@ void TransitionTreeDialog::DeletePreset()
 		RefreshAll();
 }
 
-void TransitionTreeDialog::ChangePresetScope(int index)
+void TransitionTreeDialog::ChangePresetScope(bool global)
 {
 	if (m_updating)
 		return;
 
 	Preset *preset = CurrentPreset();
-	if (!preset)
-		return;
-
-	const bool global = index == 1;
-	if (preset->global == global)
+	if (!preset || preset->global == global)
 		return;
 
 	preset->global = global;
@@ -1256,6 +2082,13 @@ void TransitionTreeDialog::AddMark()
 		mark.candidates.push_back(candidate);
 	}
 
+	/* A new mark that the filter hides would look like nothing happened. */
+	if (!m_search->text().isEmpty()) {
+		m_updating = true;
+		m_search->clear();
+		m_updating = false;
+	}
+
 	preset->marks.push_back(mark);
 	m_selectedMarkId = mark.id;
 
@@ -1289,14 +2122,52 @@ void TransitionTreeDialog::DeleteMark()
 
 	for (auto it = preset->marks.begin(); it != preset->marks.end(); ++it) {
 		if (it->id == mark->id) {
+			/* Deleting is immediate; the undo bar is the safety net. */
+			m_undoMark = std::make_unique<Mark>(*it);
+			m_undoPreset = preset->name;
+			m_undoIndex = (size_t)(it - preset->marks.begin());
 			preset->marks.erase(it);
 			break;
 		}
 	}
 
+	if (m_undoMark) {
+		m_undoLabel->setText(Tr("Mark.Deleted").arg(MarkTitle(*m_undoMark)));
+		m_undoBar->setVisible(true);
+		m_undoTimer->start();
+	}
+
 	m_selectedMarkId.clear();
 	CommitChange(true);
 	RefreshDetail();
+}
+
+void TransitionTreeDialog::UndoDeleteMark()
+{
+	Preset *preset = CurrentPreset();
+	if (!m_undoMark || !preset || preset->name != m_undoPreset) {
+		ClearUndo();
+		return;
+	}
+
+	const size_t index = std::min(m_undoIndex, preset->marks.size());
+	m_selectedMarkId = m_undoMark->id;
+	preset->marks.insert(preset->marks.begin() + (std::ptrdiff_t)index, *m_undoMark);
+	ClearUndo();
+
+	CommitChange(true);
+	RefreshDetail();
+}
+
+void TransitionTreeDialog::ClearUndo()
+{
+	m_undoMark.reset();
+	m_undoPreset.clear();
+	m_undoIndex = 0;
+	if (m_undoTimer)
+		m_undoTimer->stop();
+	if (m_undoBar)
+		m_undoBar->setVisible(false);
 }
 
 void TransitionTreeDialog::ToggleMarkEnabled()
@@ -1307,6 +2178,82 @@ void TransitionTreeDialog::ToggleMarkEnabled()
 
 	mark->enabled = !mark->enabled;
 	CommitChange(true);
+	RefreshDetail();
+}
+
+void TransitionTreeDialog::MoveMark(int delta)
+{
+	Preset *preset = CurrentPreset();
+	Mark *mark = SelectedMark();
+	if (!preset || !mark)
+		return;
+
+	const ptrdiff_t index = mark - preset->marks.data();
+	const ptrdiff_t target = index + delta;
+	if (target < 0 || target >= (ptrdiff_t)preset->marks.size())
+		return;
+
+	std::swap(preset->marks[(size_t)index], preset->marks[(size_t)target]);
+	CommitChange(true);
+	RefreshDetail();
+}
+
+void TransitionTreeDialog::PreferMark(const std::string &markId)
+{
+	/* Resolve a tie in this rule's favour by moving it to just above the
+	 * rule that currently wins the switch shown in the checker. */
+	Preset *preset = CurrentPreset();
+	if (!preset)
+		return;
+
+	const std::string canvas = m_checkCanvas->count() > 0 ? m_checkCanvas->currentText().toStdString()
+							      : MainCanvasName();
+	const auto matches = ExplainSwitch(*preset, canvas, m_checkFrom->currentText().toStdString(),
+					   m_checkTo->currentText().toStdString());
+
+	size_t winner = preset->marks.size();
+	size_t moving = preset->marks.size();
+	for (const auto &match : matches) {
+		if (match.outcome == MatchOutcome::Wins)
+			winner = match.index;
+		if (preset->marks[match.index].id == markId)
+			moving = match.index;
+	}
+	if (winner >= preset->marks.size() || moving >= preset->marks.size() || moving <= winner)
+		return;
+
+	Mark mark = preset->marks[moving];
+	preset->marks.erase(preset->marks.begin() + (std::ptrdiff_t)moving);
+	preset->marks.insert(preset->marks.begin() + (std::ptrdiff_t)winner, mark);
+
+	m_selectedMarkId = markId;
+	CommitChange(true);
+	RefreshDetail();
+}
+
+void TransitionTreeDialog::OnCheckerLink(const QString &link)
+{
+	const int colon = link.indexOf(':');
+	if (colon < 0)
+		return;
+	const QString kind = link.left(colon);
+	const std::string markId = link.mid(colon + 1).toStdString();
+	if (kind == "rule")
+		SelectMark(markId);
+	else if (kind == "prefer")
+		PreferMark(markId);
+}
+
+void TransitionTreeDialog::SelectMark(const std::string &markId)
+{
+	/* A rule the filter hides cannot be shown selected. */
+	if (!m_search->text().isEmpty()) {
+		m_updating = true;
+		m_search->clear();
+		m_updating = false;
+	}
+	m_selectedMarkId = markId;
+	RefreshTree();
 	RefreshDetail();
 }
 
@@ -1324,8 +2271,7 @@ void TransitionTreeDialog::TestMark()
 	const Candidate &candidate = mark->candidates[(size_t)index];
 
 	/* Find a destination the mark's to-side actually matches. */
-	const QString canvasName = mark->canvas.empty() ? QString::fromUtf8(MainCanvasName().c_str())
-							: QString::fromUtf8(mark->canvas.c_str());
+	const QString canvasName = mark->canvas.empty() ? Utf8(MainCanvasName()) : Utf8(mark->canvas);
 	QString destination;
 	for (const QString &scene : SceneNamesForCanvas(canvasName)) {
 		if (mark->to.Matches(scene.toStdString())) {
@@ -1339,10 +2285,8 @@ void TransitionTreeDialog::TestMark()
 		return;
 	}
 
-	if (QMessageBox::question(
-		    this, Tr("Mark.Test"),
-		    Tr("Test.Confirm").arg(QString::fromUtf8(candidate.transition.c_str())).arg(destination)) !=
-	    QMessageBox::Yes)
+	if (QMessageBox::question(this, Tr("Mark.Test"),
+				  Tr("Test.Confirm").arg(Utf8(candidate.transition), destination)) != QMessageBox::Yes)
 		return;
 
 	obs_source_t *scene = obs_get_source_by_name(destination.toUtf8().constData());
@@ -1383,14 +2327,10 @@ void TransitionTreeDialog::AddCandidate()
 	CommitChange(true);
 }
 
-void TransitionTreeDialog::RemoveCandidate()
+void TransitionTreeDialog::RemoveCandidate(int row)
 {
 	Mark *mark = SelectedMark();
-	if (!mark)
-		return;
-
-	const int row = m_candidates->currentRow();
-	if (row < 0 || row >= (int)mark->candidates.size())
+	if (!mark || row < 0 || row >= (int)mark->candidates.size())
 		return;
 
 	mark->candidates.erase(mark->candidates.begin() + row);
@@ -1400,13 +2340,12 @@ void TransitionTreeDialog::RemoveCandidate()
 	CommitChange(true);
 }
 
-void TransitionTreeDialog::MoveCandidate(int delta)
+void TransitionTreeDialog::MoveCandidate(int row, int delta)
 {
 	Mark *mark = SelectedMark();
 	if (!mark)
 		return;
 
-	const int row = m_candidates->currentRow();
 	const int target = row + delta;
 	if (row < 0 || row >= (int)mark->candidates.size() || target < 0 || target >= (int)mark->candidates.size())
 		return;
@@ -1415,7 +2354,6 @@ void TransitionTreeDialog::MoveCandidate(int delta)
 	mark->ResetRuntimeState();
 
 	RefreshMarkPage(*mark);
-	m_candidates->setCurrentCell(target, 0);
 	CommitChange(true);
 }
 
@@ -1441,16 +2379,17 @@ void TransitionTreeDialog::ImportPresets()
 	obs_data_release(data);
 
 	if (!ok) {
-		QMessageBox::warning(this, Tr("Import.Title"), QString::fromUtf8(error.c_str()));
+		QMessageBox::warning(this, Tr("Import.Title"), Utf8(error));
 		return;
 	}
 
+	/* Imports land in this scene collection; the preset menu can move any
+	 * of them to global afterwards. */
 	Store &store = GetStore();
-	const bool asGlobal = m_scopeCombo->currentIndex() == 1;
 	std::string firstName;
 
 	for (auto &preset : imported) {
-		preset.global = asGlobal;
+		preset.global = false;
 		preset.name = store.UniqueName(preset.name);
 		if (firstName.empty())
 			firstName = preset.name;
@@ -1458,8 +2397,6 @@ void TransitionTreeDialog::ImportPresets()
 	}
 
 	RefreshPresetHotkeys();
-	if (asGlobal)
-		SaveGlobalPresets();
 
 	QMessageBox::information(this, Tr("Import.Title"), Tr("Import.Done").arg(imported.size()));
 
@@ -1527,10 +2464,11 @@ void TransitionTreeDialog::CreateTransition()
 /* Helpers                                                                   */
 /* ------------------------------------------------------------------------ */
 
-void TransitionTreeDialog::ReadMatcherFromWidgets(SceneMatcher &matcher, QComboBox *typeCombo, QListWidget *sceneList)
+void TransitionTreeDialog::ReadMatcherFromWidgets(SceneMatcher &matcher, QButtonGroup *typeGroup,
+						  QListWidget *sceneList)
 {
-	const int index = typeCombo->currentIndex();
-	matcher.type = (index >= 0 && index <= 2) ? (MatchType)index : MatchType::Scenes;
+	const int id = typeGroup->checkedId();
+	matcher.type = (id >= 0 && id <= 2) ? (MatchType)id : MatchType::Scenes;
 
 	matcher.scenes.clear();
 	for (int row = 0; row < sceneList->count(); row++) {

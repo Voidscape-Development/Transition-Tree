@@ -456,6 +456,51 @@ void ClearOverrides()
 	g_armedGeneration.clear();
 }
 
+std::vector<MatchExplanation> ExplainSwitch(const Preset &preset, const std::string &canvas,
+					    const std::string &fromScene, const std::string &toScene)
+{
+	std::vector<MatchExplanation> matches;
+
+	/* First pass: the winner. Strictly greater, so the first mark listed
+	 * wins a tie. */
+	size_t best = preset.marks.size();
+	int bestScore = -1;
+	for (size_t i = 0; i < preset.marks.size(); i++) {
+		const Mark &mark = preset.marks[i];
+		if (MarkCanvas(mark) != canvas || !mark.from.Matches(fromScene) || !mark.to.Matches(toScene))
+			continue;
+		if (!mark.enabled || mark.UsableCandidates().empty())
+			continue;
+		if (mark.Score() > bestScore) {
+			best = i;
+			bestScore = mark.Score();
+		}
+	}
+
+	/* Second pass: every match, and why it lost. */
+	for (size_t i = 0; i < preset.marks.size(); i++) {
+		const Mark &mark = preset.marks[i];
+		if (MarkCanvas(mark) != canvas || !mark.from.Matches(fromScene) || !mark.to.Matches(toScene))
+			continue;
+
+		MatchOutcome outcome;
+		if (!mark.enabled)
+			outcome = MatchOutcome::Off;
+		else if (mark.UsableCandidates().empty())
+			outcome = MatchOutcome::NoTransition;
+		else if (i == best)
+			outcome = MatchOutcome::Wins;
+		else if (mark.Score() < bestScore)
+			outcome = MatchOutcome::LessSpecific;
+		else
+			outcome = MatchOutcome::TiedListedLater;
+
+		matches.push_back({i, outcome});
+	}
+
+	return matches;
+}
+
 Mark *ResolveMark(const std::string &canvas, const std::string &fromScene, const std::string &toScene)
 {
 	Store &store = GetStore();
@@ -466,27 +511,11 @@ Mark *ResolveMark(const std::string &canvas, const std::string &fromScene, const
 	if (!preset)
 		return nullptr;
 
-	Mark *best = nullptr;
-	int bestScore = -1;
-
-	for (auto &mark : preset->marks) {
-		if (!mark.enabled)
-			continue;
-		if (MarkCanvas(mark) != canvas)
-			continue;
-		if (!mark.from.Matches(fromScene) || !mark.to.Matches(toScene))
-			continue;
-		if (mark.UsableCandidates().empty())
-			continue;
-
-		/* Strictly greater, so the first mark listed wins a tie. */
-		if (mark.Score() > bestScore) {
-			best = &mark;
-			bestScore = mark.Score();
-		}
+	for (const auto &match : ExplainSwitch(*preset, canvas, fromScene, toScene)) {
+		if (match.outcome == MatchOutcome::Wins)
+			return &preset->marks[match.index];
 	}
-
-	return best;
+	return nullptr;
 }
 
 bool ResolveTransition(const std::string &canvas, const std::string &fromScene, const std::string &toScene,
